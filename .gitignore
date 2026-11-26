@@ -50,3 +50,4 @@ lerna-debug.log*
 # 呃
 .claude
 .deepseek
+.dsh-meow/

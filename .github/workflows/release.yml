@@ -240,9 +240,14 @@ jobs:
           #        · -Wl,a,b      → `a b`
           #        · -lstdc++     → 丢弃（BoringSSL 无任何 libc++/libstdc++ 引用，
           #                          boring-sys 只是无条件追加了它）
-          RUST_LLD="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/gcc-ld/ld.lld"
+          SYSROOT="$(rustc --print sysroot)"
+          RUST_LLD="$SYSROOT/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/gcc-ld/ld.lld"
           test -x "$RUST_LLD"
+          # rustup 的 musl self-contained 目录：crt1.o/crti.o/crtbegin.o/crtend.o/crtn.o/libc.a/libunwind.a
+          MUSL_SELFC="$SYSROOT/lib/rustlib/${ZIG_TRIPLE_RUST}/lib/self-contained"
+          test -f "$MUSL_SELFC/crt1.o"
           echo "RUST_LLD=$RUST_LLD" >> "$GITHUB_ENV"
+          echo "MUSL_SELFC=$MUSL_SELFC" >> "$GITHUB_ENV"
           mkdir -p /opt/musl-cc
           for mode in cc c++; do
             wrapper="/opt/musl-cc/${ZIG_ARCH}-linux-musl-${mode}"
@@ -259,6 +264,7 @@ jobs:
             case "$a" in
               --target=*) continue ;;
               -target) skip_next=1; continue ;;
+              -Wa,*) continue ;;
               -c|-E|-S|-M|-MM|-fsyntax-only) compile_only="yes" ;;
             esac
             clean="$clean
@@ -283,6 +289,7 @@ jobs:
             fi
             case "$a" in
               --target=*|-m64|-m32|-march=*|-mtune=*|-mcmodel=*) continue ;;
+              -ffunction-sections|-fdata-sections|-fno-function-sections|-fno-data-sections|-w) continue ;;
               -nostartfiles|-nodefaultlibs|-nostdlib|-static-libgcc) continue ;;
               -pthread|-shared|-rdynamic|-fsyntax-only|-c|-E|-S) continue ;;
               -lstdc++|-lc++|-lc++abi|-lsupc++) continue ;;
@@ -292,13 +299,22 @@ jobs:
               -o|-L|-l|-isystem|-I|-D|-U|-MF|-MT|-MQ) prev="$a"; need_val=1; continue ;;
               -Wl,*) lld_args="$lld_args $(printf '%s' "${a#-Wl,}" | tr ',' ' ')" ;;
               -Wl*)  lld_args="$lld_args $(printf '%s' "${a#-Wl}" | tr ',' ' ')" ;;
+              -f*) continue ;;
+              -D*|-U*|-I*|-MF*|-MT*|-MQ*|-MD|-MMD) continue ;;
               *) lld_args="$lld_args $a" ;;
             esac
           done
           # 不传 -m：lld 从输入对象文件推断目标架构（elf_aarch64 不被识别，aarch64linux/x86_64linux 因版本而异）
+          # cmake 的 try-compile 程序不会自带 crt/libc（rustc 只在最终产物的链接参数里带 rcrt1.o）；
+          # 若参数里没有 crt 目标文件，就补上 rustup musl self-contained 的 crt + libc，
+          # 否则 pthread 等探测会 undefined symbol。最终 Rust 产物自带 rcrt1.o → 跳过，避免重复 _start。
+          case "$lld_args" in
+            *crt1.o*|*rcrt1.o*|*Scrt1.o*) ;;
+            *) lld_args="-static -L__SELFC__ __SELFC__/crt1.o __SELFC__/crti.o __SELFC__/crtbegin.o $lld_args __SELFC__/crtend.o __SELFC__/crtn.o -lc -lunwind" ;;
+          esac
           exec __LLD__ $lld_args
           WRAP
-            sed -i "s#__ZIG__#/opt/zig-linux-${ZIG_ARCH}-0.13.0/zig#; s#__MODE__#${mode}#; s#__TRIPLE__#${ZIG_TARGET}#; s#__LLD__#$RUST_LLD#" "$wrapper"
+            sed -i "s#__ZIG__#/opt/zig-linux-${ZIG_ARCH}-0.13.0/zig#; s#__MODE__#${mode}#; s#__TRIPLE__#${ZIG_TARGET}#; s#__LLD__#$RUST_LLD#; s#__SELFC__#$MUSL_SELFC#" "$wrapper"
           done
           printf '#!/bin/sh\nexec /opt/zig-linux-%s-0.13.0/zig ar "$@"\n' "${ZIG_ARCH}" > /opt/musl-cc/${ZIG_ARCH}-linux-musl-ar
           chmod +x /opt/musl-cc/*
@@ -322,6 +338,22 @@ jobs:
             echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_musl=$MUSL_INC"
           } >> "$GITHUB_ENV"
           echo "/opt/musl-cc" >> "$GITHUB_PATH"
+          # `boring-sys2` 用 `cmake` crate 构建 BoringSSL。cmake crate 会用 cc-rs 探测
+          # C 编译器，并按 `CMAKE_<LANG>_FLAGS` 注入 `--target=aarch64-unknown-linux-musl`
+          # 这类交叉参数；但 Rust 的 host triple 是 `*-linux-gnu`，target 是 `*-linux-musl`，
+          # 两者不相等使它判定为“交叉编译”，探测时却退回系统 `/usr/bin/cc` 并在
+          # `--target` 上报错。给出一份 cmake toolchain 文件，把编译器硬指到 zig wrapper，
+          # 同时 bearing-sys2 见到 `CMAKE_TOOLCHAIN_FILE` 会跳过自身交叉定义；wrapper 会
+          # 剥掉 `--target`（zig 已按 musl target 编译）。
+          TC="/opt/musl-cc/${ZIG_TARGET}-toolchain.cmake"
+          cat > "$TC" <<EOF
+          set(CMAKE_SYSTEM_NAME Linux)
+          set(CMAKE_C_COMPILER   /opt/musl-cc/${ZIG_ARCH}-linux-musl-cc)
+          set(CMAKE_CXX_COMPILER /opt/musl-cc/${ZIG_ARCH}-linux-musl-c++)
+          set(CMAKE_ASM_COMPILER /opt/musl-cc/${ZIG_ARCH}-linux-musl-cc)
+          EOF
+          echo "CMAKE_TOOLCHAIN_FILE_x86_64_unknown_linux_musl=$TC" >> "$GITHUB_ENV"
+          echo "CMAKE_TOOLCHAIN_FILE_aarch64_unknown_linux_musl=$TC" >> "$GITHUB_ENV"
           cat /opt/musl-cc/${ZIG_ARCH}-linux-musl-cc
       - name: Build
         run: |
