@@ -182,6 +182,7 @@ jobs:
   build-linux-musl:
     needs: [build-frontend, test]
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
@@ -356,7 +357,6 @@ jobs:
           echo "CMAKE_TOOLCHAIN_FILE_x86_64_unknown_linux_musl=$TC" >> "$GITHUB_ENV"
           echo "CMAKE_TOOLCHAIN_FILE_aarch64_unknown_linux_musl=$TC" >> "$GITHUB_ENV"
           echo "CMAKE_TOOLCHAIN_FILE=$TC" >> "$GITHUB_ENV"
-          echo "===TOOLCHAIN-FILE==="; cat "$TC"; echo "===LS-MUSL-CC==="; ls -l /opt/musl-cc/; test -x "/opt/musl-cc/${ZIG_ARCH}-linux-musl-cc" && echo wrapper-ok || echo wrapper-MISSING
           cat /opt/musl-cc/${ZIG_ARCH}-linux-musl-cc
       - name: Build
         run: |
@@ -375,6 +375,12 @@ jobs:
           export CC="${{ matrix.zig_arch }}-linux-musl-cc"
           export CXX="${{ matrix.zig_arch }}-linux-musl-c++"
           export AR="${{ matrix.zig_arch }}-linux-musl-ar"
+          # rust-cache 会连 target/ 下 boring-sys2 的 `out/build/CMakeCache.txt` 一起
+          # 恢复；旧缓存把 `CMAKE_C_COMPILER` 钉成 `/usr/bin/cc`，而 toolchain 文件里的
+          # 非 CACHE `set()` 覆盖不了缓存值，导致 aarch64 仍用系统 cc 并在 `--target` 炸。
+          # 构建前强制清掉所有 boring-sys2 的 cmake 构建目录。
+          find "target" -type d -path "*boring-sys2-*/out/build" -prune -exec rm -rf {} + 2>/dev/null || true
+          find "target" -type d -path "*boring-sys2-*/out" -prune -exec rm -rf {} + 2>/dev/null || true
           cargo build --release --locked --target ${{ matrix.target }}
       - name: Verify static linkage
         run: |
