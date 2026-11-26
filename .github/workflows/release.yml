@@ -295,10 +295,10 @@ jobs:
               *) lld_args="$lld_args $a" ;;
             esac
           done
-          # GNU 驱动按 -m elf_<arch> 选择目标格式
-          exec __LLD__ -m __EMU__ $lld_args
+          # 不传 -m：lld 从输入对象文件推断目标架构（elf_aarch64 不被识别，aarch64linux/x86_64linux 因版本而异）
+          exec __LLD__ $lld_args
           WRAP
-            sed -i "s#__ZIG__#/opt/zig-linux-${ZIG_ARCH}-0.13.0/zig#; s#__MODE__#${mode}#; s#__TRIPLE__#${ZIG_TARGET}#; s#__LLD__#$RUST_LLD#; s#__EMU__#elf_${ZIG_ARCH}#" "$wrapper"
+            sed -i "s#__ZIG__#/opt/zig-linux-${ZIG_ARCH}-0.13.0/zig#; s#__MODE__#${mode}#; s#__TRIPLE__#${ZIG_TARGET}#; s#__LLD__#$RUST_LLD#" "$wrapper"
           done
           printf '#!/bin/sh\nexec /opt/zig-linux-%s-0.13.0/zig ar "$@"\n' "${ZIG_ARCH}" > /opt/musl-cc/${ZIG_ARCH}-linux-musl-ar
           chmod +x /opt/musl-cc/*
@@ -333,6 +333,13 @@ jobs:
           export AR_aarch64_unknown_linux_musl="${{ matrix.zig_arch }}-linux-musl-ar"
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="${{ matrix.zig_arch }}-linux-musl-cc"
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="${{ matrix.zig_arch }}-linux-musl-cc"
+          # `boring-sys2` 用 `cmake` crate 构建 BoringSSL，它按 `CC`/`CXX`（不带 target
+          # 后缀）探测 C/C++ 编译器，并自行追加 `--target=<triple>`；只设 target 后缀的
+          # `CC_<triple>` 不够，cmake 会退回系统 `/usr/bin/cc` 并在 `--target` 上报错。
+          # 本永远是原生构建（host == target），因此可直接把裸 `CC/CXX/AR` 指向 zig wrapper。
+          export CC="${{ matrix.zig_arch }}-linux-musl-cc"
+          export CXX="${{ matrix.zig_arch }}-linux-musl-c++"
+          export AR="${{ matrix.zig_arch }}-linux-musl-ar"
           cargo build --release --locked --target ${{ matrix.target }}
       - name: Verify static linkage
         run: |
