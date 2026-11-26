@@ -355,6 +355,7 @@ jobs:
           EOF
           echo "CMAKE_TOOLCHAIN_FILE_x86_64_unknown_linux_musl=$TC" >> "$GITHUB_ENV"
           echo "CMAKE_TOOLCHAIN_FILE_aarch64_unknown_linux_musl=$TC" >> "$GITHUB_ENV"
+          echo "CMAKE_TOOLCHAIN_FILE=$TC" >> "$GITHUB_ENV"
           cat /opt/musl-cc/${ZIG_ARCH}-linux-musl-cc
       - name: Build
         run: |
