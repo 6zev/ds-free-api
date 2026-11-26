@@ -356,6 +356,7 @@ jobs:
           echo "CMAKE_TOOLCHAIN_FILE_x86_64_unknown_linux_musl=$TC" >> "$GITHUB_ENV"
           echo "CMAKE_TOOLCHAIN_FILE_aarch64_unknown_linux_musl=$TC" >> "$GITHUB_ENV"
           echo "CMAKE_TOOLCHAIN_FILE=$TC" >> "$GITHUB_ENV"
+          echo "===TOOLCHAIN-FILE==="; cat "$TC"; echo "===LS-MUSL-CC==="; ls -l /opt/musl-cc/; test -x "/opt/musl-cc/${ZIG_ARCH}-linux-musl-cc" && echo wrapper-ok || echo wrapper-MISSING
           cat /opt/musl-cc/${ZIG_ARCH}-linux-musl-cc
       - name: Build
         run: |
