@@ -347,11 +347,15 @@ fn default_wasm_url() -> String {
     "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm".to_string()
 }
 
-/// 默认 UA：桌面 Chrome（与默认 `client_platform = web` / `emulation = chrome136` 自洽）
+/// 默认 UA：原生安卓 App（与默认 `client_platform = android` / `emulation = okhttp4_12` 自洽）
 ///
 /// 依据 2026-10-07 的真实浏览器抓包：官方 Web 客户端就是一套 Chrome 身份。
 fn default_user_agent() -> String {
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36".to_string()
+    // 默认对齐原生安卓 App（OkHttp）：AWS WAF 对桌面浏览器身份下发 JS challenge
+    // （HTTP 202），本项目的 HTTP 客户端无法执行 JS，因此 web 身份在 datacenter/直连
+    // IP 上必被拦（见 ds_core/raw-api-reference.md「WAF」节与 docs/development.md）。
+    // Android 身份 login 为明文且无需过 JS challenge，实测可直连登录成功。
+    "DeepSeek/2.5.0 Android/35".to_string()
 }
 
 fn default_client_version() -> String {
@@ -359,8 +363,9 @@ fn default_client_version() -> String {
 }
 
 fn default_client_platform() -> String {
-    // 官方 Web 客户端发 `web`（抓包：x-client-platform: web）
-    "web".to_string()
+    // 原生 App 身份发 `android`（与 `user_agent = DeepSeek/… Android/…` 自洽）。
+    // web 身份（`web`）会被 AWS WAF 下发 202 JS challenge，客户端无法执行，故默认走 App。
+    "android".to_string()
 }
 
 fn default_client_locale() -> String {
@@ -376,8 +381,8 @@ fn default_client_timezone_offset() -> String {
 }
 
 fn default_client_os() -> String {
-    // 登录 payload 的 os 字段；官方 Web 客户端为 `web`
-    "web".to_string()
+    // 登录 payload 的 os 字段；原生 App 身份为 `android`（与 client_platform 自洽）
+    "android".to_string()
 }
 
 const fn default_hif_enabled() -> bool {
@@ -431,8 +436,9 @@ const fn default_session_idle_secs() -> u64 {
 }
 
 fn default_emulation() -> String {
-    // 默认对齐浏览器：TLS/HTTP2 指纹 + 默认头都用 chrome136
-    "chrome136".to_string()
+    // 默认对齐原生安卓 App（OkHttp）：TLS/HTTP2 指纹 + 默认头与 Android UA 自洽，
+    // 也是当前唯一能绕过 AWS WAF 202 challenge 的档位（见 ds_core/raw-api-reference.md）。
+    "okhttp4_12".to_string()
 }
 
 /// HTTP 服务器配置（必填）

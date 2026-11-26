@@ -327,17 +327,19 @@ const DEFAULT_HIF_DLIQ_URL: &str = "https://hif-dliq.deepseek.com/query";
 /// 「地址栏导航」头（`sec-fetch-dest: document`、`accept: text/html,…`）是
 /// 任何真实客户端都不会有的组合（2026-10-07 本地 echo server 取证）。
 ///
-/// **默认档位是浏览器**（`chrome136`）：官方 Web 客户端就是一套 Chrome 身份，
-/// 而「对齐真实客户端」是降低风控暴露面的唯一可操作原则 —— 我们并不知道上游
-/// 具体依据哪些信号判定违规，因此每一项都向真实客户端靠拢（见 `docs/development.md`）。
+/// **默认档位是安卓 App**（`okhttp4_12`）：AWS WAF 对桌面浏览器身份下发 JS challenge
+/// （HTTP 202），本 HTTP 客户端无法执行 JS，因此 web 身份在 datacenter/直连 IP 上必被拦；
+/// 安卓 App 身份 login 为明文、无需过 JS challenge，是与服务端「App 客户端」对齐的现实选择
+/// （见 `docs/login-encryption-audit.md` 方案 B、`ds_core/raw-api-reference.md`「WAF」节）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EmulationProfile {
-    /// 原生安卓 App（OkHttp）：默认头只有 `accept: */*` / `accept-language` / UA，
-    /// 与 `user_agent = "DeepSeek/… Android/…"` + `client_platform = android` 自洽
-    OkHttp4_12,
-    /// 桌面 Chrome（默认）：带 `sec-ch-ua*` / `sec-fetch-*` / 文档 accept，
-    /// 需要同时把 UA / `client_platform` / `client_os` 切成 web 才自洽
+    /// 原生安卓 App（OkHttp）：默认，与 `user_agent = "DeepSeek/… Android/…"`
+    /// + `client_platform = android` 自洽
     #[default]
+    OkHttp4_12,
+    /// 桌面 Chrome：带 `sec-ch-ua*` / `sec-fetch-*` / 文档 accept，
+    /// 需要同时把 UA / `client_platform` / `client_os` 切成 web 才自洽。
+    /// 注意：AWS WAF 对该身份会下发 JS challenge（202），本客户端无法通过。
     Chrome136,
 }
 
@@ -1187,8 +1189,8 @@ mod tests {
         assert_eq!(EmulationProfile::from_config("nope"), None);
         assert_eq!(
             EmulationProfile::default(),
-            EmulationProfile::Chrome136,
-            "默认档位对齐浏览器（chrome136）"
+            EmulationProfile::OkHttp4_12,
+            "默认档位对齐安卓 App（okhttp4_12），web 身份会被 AWS WAF 202 challenge 拦下"
         );
     }
 

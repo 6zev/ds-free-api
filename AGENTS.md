@@ -19,7 +19,7 @@ Rust API proxy exposing free DeepSeek model endpoints. Translates standard OpenA
 - `wasmtime` — executes DeepSeek's PoW WASM solver; the entire PoW system depends on this (pinned to 48.x, see `.cargo/audit.toml`)
 - `tiktoken-rs` — client-side prompt token counting (DeepSeek returns 0 for `prompt_tokens`)
 - `pin-project-lite` — underpins every streaming response wrapper (`ConverterStream`, `ToolCallStream`, `RepairStream`, `StopDetectStream`)
-- `axum` / `wreq` — HTTP server and client respectively; `wreq` uses BoringSSL, and the TLS/HTTP2 fingerprint is selected by the `emulation` config (`chrome136` = desktop Chrome, **default**; `okhttp4_12` = native Android app) so that the fingerprint matches the UA / `client_platform` identity. The preset's *header* defaults are navigation-style and are overridden in `ClientIdentity::headers` — see the capability toggles
+- `axum` / `wreq` — HTTP server and client respectively; `wreq` uses BoringSSL, and the TLS/HTTP2 fingerprint is selected by the `emulation` config (`okhttp4_12` = native Android app, **default**; `chrome136` = desktop Chrome) so that the fingerprint matches the UA / `client_platform` identity. The default identity is the whole Android App set (Android UA + `client_platform=android` + `client_os=android` + `okhttp4_12`) because AWS WAF issues a JS challenge (HTTP 202) to desktop-browser identities that this client cannot solve. The `chrome136` preset's *header* defaults are navigation-style and are overridden in `ClientIdentity::headers` — see the capability toggles
 - `tokio` with `signal` feature — async runtime with graceful shutdown on SIGTERM/SIGINT
 
 ---
@@ -407,16 +407,22 @@ Request fields mapped in `request/resolver.rs`:
   are skipped; if every account is over budget the request returns 429 instead of
   hammering upstream. This exists because upstream mutes accounts after a few hundred
   requests per hour, and muting is **delayed** — see `docs/development.md`.
-- **Transport emulation** (`emulation`, default `chrome136`): the TLS/HTTP2 fingerprint plus the
-  profile's default headers. **Defaults now describe a desktop browser** (Chrome/140 Windows UA,
-  `client_platform = web`, `client_os = web`) because the official web client is exactly that.
-  Switching the profile alone is *not* enough: wreq's `chrome136` preset sends **address-bar
-  navigation** headers (`sec-fetch-dest: document`, `mode: navigate`, `accept: text/html,…`,
-  `priority`, `sec-ch-ua-platform: "macOS"`), so `ClientIdentity::headers()` explicitly overrides
-  them with the captured **XHR** set (`accept: */*`, `sec-fetch-dest: empty`, `mode: cors`,
-  `site: same-origin` — `cross-site` for token endpoints — `sec-ch-ua-platform: "Windows"`,
-  plus `referer`). Header-by-header evidence: `docs/development.md` (echo server vs capture).
-  The 2026-09 note that "desktop Chrome UA is blocked by WAF 202" no longer holds.
+- **Transport emulation** (`emulation`, default `okhttp4_12`): the TLS/HTTP2 fingerprint plus the
+  profile's default headers. **Defaults now describe the native Android App** (DeepSeek Android UA,
+  `client_platform = android`, `client_os = android`) because AWS WAF issues a JS challenge
+  (HTTP 202) to desktop-browser identities that this client cannot solve — the Android App login
+  is plaintext and passes the WAF on any non-blocked IP (verified 2026-11-26: web/Chrome → 202,
+  Android → success on the same proxy and on a direct IP). See `docs/login-encryption-audit.md`
+  (方案 B) and `ds_core/raw-api-reference.md`「WAF 绕过」. To use the **web** identity
+  (`chrome136`) you must switch `user_agent` / `client_platform` / `client_os` to web **and**
+  `emulation = "chrome136"`; note that wreq's `chrome136` preset sends **address-bar navigation**
+  headers (`sec-fetch-dest: document`, `mode: navigate`, `accept: text/html,…`, `priority`,
+  `sec-ch-ua-platform: "macOS"`), so `ClientIdentity::headers()` explicitly overrides them with the
+  captured **XHR** set (`accept: */*`, `sec-fetch-dest: empty`, `mode: cors`, `site: same-origin` —
+  `cross-site` for token endpoints — `sec-ch-ua-platform: "Windows"`, plus `referer`).
+  Header-by-header evidence: `docs/development.md` (echo server vs capture).
+  The 2026-09 note that "desktop Chrome UA is blocked by WAF 202" holds again as of 2026-11-26 for
+  web identities.
 - **HIF risk tokens** (`hif_enabled`, default true): the official client polls **two**
   isomorphic endpoints (`hif-leim.deepseek.com` / `hif-dliq.deepseek.com`), caches both
   (`hif_leim_cached` / `hif_dliq_cached`, TTL from `x-hif-ttl`, default 600s) and attaches
@@ -642,7 +648,7 @@ Follow `docs/code-style.md`:
 |-------|---------|--------------------|
 | WASM load failure | `PowError::Execution` on startup | DeepSeek recompiled WASM. PowSolver now uses dynamic export probing (no hardcoded symbols). Update `wasm_url` in `config.toml` if WASM URL changed |
 | WAF blocking (non-US) | AWS WAF Challenge response (status 202) | Configure a non-US proxy in `config.toml` `[proxy]` |
-| WAF blocking (fingerprint) | HTTP 403 / connection reset / 202 challenge | `wreq` uses BoringSSL; the fingerprint is chosen by `emulation` (`chrome136` default = desktop Chrome, matching the default web identity; `okhttp4_12` for the Android-app identity). Verify the identity is self-consistent (UA ↔ `client_platform` ↔ emulation) with `cargo run -p ds_core --example identity_probe` — it hits only unauthenticated endpoints, no account traffic |
+| WAF blocking (fingerprint) | HTTP 403 / connection reset / 202 challenge | `wreq` uses BoringSSL; the fingerprint is chosen by `emulation` (`okhttp4_12` **default** = native Android app, matching the default Android identity; `chrome136` = desktop Chrome, only usable when the network's WAF lets web identities through). AWS WAF issues a JS challenge (HTTP 202) to desktop-browser identities that this client cannot solve, so keep the identity self-consistent (UA ↔ `client_platform` ↔ `client_os` ↔ emulation) — switching to web means switching **all four** to web. Verify with `cargo run -p ds_core --example identity_probe` — it hits only unauthenticated endpoints, no account traffic |
 | Account init failure | All accounts stuck in init | Bad credentials (login fails first) or rate-limited (too many sessions). Check `[accounts]` in config |
 | Login fails with `RISK_DEVICE_DETECTED` (biz_code 11) | `客户端错误: Business error: code=11, msg=RISK_DEVICE_DETECTED` during account init | DeepSeek requires a browser-registered device fingerprint. Capture `device_id` from a real browser login (`POST /api/v0/users/login`) and set it per account in `config.toml` / the admin panel |
 | Account init fails with `user is muted` (biz_code 5) | `账号配置错误: 账号异常(muted/limited)`, account left in `invalid` | The account is temporarily muted upstream (response carries `mute_until`, typically days). It cannot be recovered by re-login — stop using the account until `mute_until` passes; further retries do not speed it up. Muting is **delayed**, so "ran N requests without being muted" is not evidence that a change avoids risk control — see `docs/development.md` |

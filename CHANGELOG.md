@@ -4,7 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.6.1] - 2026-11-26
+
+### 修复：默认身份整体对齐安卓 App，绕开 AWS WAF 202 challenge（行为变更）
+
+- **根因**：`017954a` 把默认身份整体换成了桌面浏览器（Chrome UA + `client_platform=web` +
+  `client_os=web` + `emulation=chrome136`），而 AWS WAF 对桌面浏览器身份下发 **JS challenge
+  （HTTP 202）**，本客户端解不了，于是所有登录都在 WAF 层就被挡下 —— **跟 IP / 代理地区无关**。
+- **实测（2026-11-26，同一出口）**：web/`chrome136` → 202（直连 FR IP、NL 代理都一样）；
+  Android/`okhttp4_12` → 登录成功（直连 FR IP、NL 代理、`login_encryption=true` 都一样）。
+  裸 curl 对照：web UA → 202，Android UA → 422（已过 WAF，进入校验层）。
+- **改动**：默认值改为完整的安卓 App 身份 —— `user_agent = "DeepSeek/2.5.0 Android/35"`、
+  `client_platform = "android"`、`client_os = "android"`、`emulation = "okhttp4_12"`
+  （`EmulationProfile::default()` 同步改为 `OkHttp4_12`）。四者自洽，不要再混搭 web 指纹。
+- 想用 **web 身份**（`chrome136`）时，必须把上述四个字段**一起**切到 web —— 单独改 emulation
+  会得到不自洽的身份，照样 202。
+- 文档同步更新：`config.example.toml` / `docker/config.example.toml`、`docs/development.md`
+  （2026-11-26 再复查）、`ds_core/raw-api-reference.md`（WAF 绕过章节）、`AGENTS.md`
+  （依赖说明、能力开关、Troubleshooting）。
 
 ## [0.6.0] - 2026-11-26
 

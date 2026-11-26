@@ -584,6 +584,12 @@ x-client-platform: web ; x-client-version: 2.5.0 ; x-device-id: <uuid> ; x-devic
 
 > 注意：这与 2026-09-20 的结论「桌面 Chrome UA 会被 WAF 202 拦截」**不一致**，
 > 现在三种身份都能到达应用层。WAF 规则显然变化过，之前的结论已过时。
+>
+> **2026-11-26 再复查**：WAF 规则又变回去了 —— 在非 US 代理与直连（FR）IP 上，
+> **桌面 Chrome/web 身份的 `/users/login` 重新下发 202 JS challenge**，而**安卓 App 身份
+> 在同样 IP 上登录成功**。由此确认：决定 202 的是**身份（UA/平台/指纹）**而非 IP 国别，
+> 因此默认身份已从「okhttp TLS + web UA」这一**混合形态**改为**整套安卓 App 身份**
+> （Android UA + `client_platform=android` + `client_os=android` + `okhttp4_12`）。
 
 **2026-10-07 决定**：默认档位改为 **B（OkHttp 原生 App）**，即
 `emulation = "okhttp4_12"` —— 保留「安卓 App」身份（UA / `client_platform` /
@@ -692,16 +698,40 @@ UA / `client_platform` / `client_os` 切成 web，则应同时设 `emulation = "
   +19min / +37min 被停用 —— 触发因素与**客户端形态/请求形态**相关，
   而不是账号「一登录就封」或单纯的时间流逝；
 - 因此下一步的排查重点是**请求形态的自洽性**：
-  1. ~~身份/头部自洽~~（**已修**：默认整体改为浏览器档 —— Chrome/140 UA + `web` 平台
-     + `chrome136` 指纹，并把档位自带的「地址栏导航」头覆盖为抓包实测的 XHR 形态，
-     见上文「默认配置：对齐浏览器」）
+  1. ~~身份/头部自洽~~（**已修**：默认整体改为**原生安卓 App 身份** —— Android UA
+     + `client_platform=android` + `client_os=android` + `okhttp4_12` 指纹；再于 2026-11-26
+     复查发现 AWS WAF 已对桌面 Chrome/web 身份恢复下发 202 JS challenge，而安卓身份可直连登录，
+     故把**整套身份**（不止 TLS 档）统一为 Android，见上文「2026-10-07 决定」与
+     `login-encryption-audit.md` 方案 B）
   2. 会话生命周期（真实客户端一个会话长期复用、几乎不删；我们是「建会话 → 发一条 → 立刻删」
      且整轮初始化在数秒内完成 6 个请求）
   3. 启动时就发一条 completion 的 health_check（真实客户端启动只建会话、不发消息）
-  4. ~~TLS/HTTP2 指纹与头部的组合~~（**已修**：`chrome136` + XHR 头，与 UA/平台自洽）
+  4. ~~TLS/HTTP2 指纹与头部的组合~~（**已修**：2026-11-26 起默认整套 Android 身份 ——
+     `okhttp4_12` TLS + Android UA + android 平台/os，自洽）
   5. ~~prompt 形态~~（**已修**：复用会话时只发新增用户消息、零角色标签，见上文「prompt 形态对齐」）
 - **验证前提**：三个账号都已被停用（临时），若要验证以上任一改动，需要**全新账号**
   （或等解禁），且监控必须低频、只用官方浏览器打开页面观察。
+
+### 2026-11-27 澄清：WAF 层与风控层是两件事（不要混为一谈）
+
+复盘时容易把「Android 身份」当成禁用相关的问题，其实这里有两层独立的判定：
+
+| 层 | 判定方 | 触发信号 | 表现 | 修法 |
+|----|--------|----------|------|------|
+| **WAF 层** | AWS WAF（CloudFront 前） | **身份形态**（UA / `client_platform` / TLS 指纹）；与 IP 国别基本无关 | HTTP **202** + `x-amzn-waf-action: challenge`（无法解 JS） | 整套身份自洽；当前唯一可用组合 = 安卓 App（Android UA + `android` + `okhttp4_12`） |
+| **风控层** | DeepSeek 业务 | 缺 `x-hif-leim`、`device_id`/`X-Device-Id` 被多账号共用、请求强度与节奏 | `biz_code=5`（禁言，带 `mute_until`）/ `10`（封禁）/ `11`（设备风控） | 双 HIF 令牌 + 每账号独立 `device_id` + 每小时配额 + `request_min_interval_secs` + 会话复用 |
+
+要点：
+
+- **UA = Android 不是封号原因**。Android 身份解决的是「登录/请求能不能进到业务层」
+  （WAF）；而历史上导致禁言的决定性信号是 `/chat/completion` 上**缺少 `x-hif-leim`**
+  （见上文「为什么这能解释此前的全部现象」），与 UA 无关。
+- 反过来说，`017954a` 把身份改成「仿真实浏览器」的动机是压低风控，但**当前 WAF 规则
+  会直接把它 202 掉**，所以在 WAF 规则再次变化前，安卓 App 身份是**唯一可登录**的选项，
+  不是「为了安全选的」，而是「为了能用选的」。
+- 因此判断某个改动有没有减少封号风险，只能看**风控层指标**（`is_muted` / `mute_until`
+  的变化、延迟判定的观察窗口），不能用「登录成功」或「没被 202」当证据。
+  2026-11-26 那次修复只解决了 WAF 层，风控层没有任何新证据 —— 仍按「未验证」对待。
 
 #### 2026-10-07 23:23 (+08:00)：解封时间复查 —— **没有可观测的解封时间**
 

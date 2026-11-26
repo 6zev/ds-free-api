@@ -778,3 +778,9 @@ Content-Type: text/plain
 - 2026-10-07 实测：三种身份组合（安卓 App + Chrome136 / 全 Web Chrome / 安卓 App + OkHttp）
   在 `/client/settings`、`/users/login`、`/chat/create_pow_challenge`、`/chat_session/create`
   上均无 202 challenge —— 早期「桌面 Chrome UA 必被拦截」的结论已不适用
+- **2026-11-26 复查（WAF 规则再次变化）**：在非 US 代理（NL/HK）与直连（FR）IP 上，
+  **桌面 Chrome/web 身份（CH Chrome UA 或 `client_platform=web`）的 `/users/login` 又恢复
+  下发 202 JS challenge**，而**安卓 App 身份（Android UA + `okhttp4_12`）在同样 IP 上可登录成功**
+  （`/users/login` 返回业务 200 / `biz_code=2`；带真实 `device_id` 则登录成功）。
+  结论：决定是否被 202 的是**身份（UA/平台/指纹）**，不是 IP 国别 —— 故默认身份已整体
+  切到安卓 App（见 `src/config.rs` 的 `default_*`），web 身份仅在 WAF 放行的网络才可用。
