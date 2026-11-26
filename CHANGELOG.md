@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-26
+
 ### 新增：单账号最小请求间隔（`request_min_interval_secs`）
 
 - 除每小时配额之外，新增**时间分布**维度的限速：`[ds_core] request_min_interval_secs`
