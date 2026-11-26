@@ -383,9 +383,18 @@ jobs:
           find "target" -type d -path "*boring-sys2-*/out" -prune -exec rm -rf {} + 2>/dev/null || true
           cargo build --release --locked --target ${{ matrix.target }}
       - name: Verify static linkage
+        # The binary has no --version mode (it always boots the HTTP server), so only
+        # check the ELF for a dynamic interpreter / NEEDED entries. `ldd` prints
+        # "statically linked" (exit 0) for a static musl binary; a dynamic one lists libs.
         run: |
-          ldd "target/${{ matrix.target }}/release/ds-free-api" && exit 1 || true
-          "target/${{ matrix.target }}/release/ds-free-api" --version || true
+          bin="target/${{ matrix.target }}/release/ds-free-api"
+          out="$(ldd "$bin" 2>&1 || true)"
+          echo "$out"
+          if echo "$out" | grep -qiE 'statically linked|not a dynamic'; then
+            echo "static linkage OK"
+          else
+            echo "ERROR: binary is dynamically linked"; exit 1
+          fi
       - name: Package
         run: |
           name="ds-free-api-${{ steps.meta.outputs.tag }}-${{ matrix.suffix }}"
