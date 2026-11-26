@@ -193,7 +193,16 @@
     "sessionPolicy": "会话策略",
     "sessionPolicyDesc": "默认 reuse（对齐真实客户端：一个会话长期复用、几乎不删）；per_request = 每个请求新建会话、流结束即删除（旧行为）。复用语义尚未用真实账号验证。",
     "sessionIdleSecs": "复用会话空闲回收（秒，0 = 仅退出时删除）",
-    "quotaLabel": "请求数 / 小时 / 账号"
+    "quotaLabel": "请求数 / 小时 / 账号",
+    "minInterval": "单账号最小请求间隔",
+    "minIntervalDesc": "同一账号两次请求之间至少间隔的秒数（0 = 不限制）。上游不只看每小时总量，也看时间分布：真实用户发消息稀疏且不规律，恒速一问一答是明显机器特征。启用后会在间隔上叠加 0~40% 随机抖动。多账号池建议 60~300。",
+    "minIntervalLabel": "秒 / 请求 / 账号",
+    "heartbeatLabel": "思考心跳（秒）",
+    "heartbeatDesc": "纯思考静默期发送 SSE 注释保活（0 = 关闭）。",
+    "autoResumeDesc": "上游截断长思考时自动续写。",
+    "autoResumeAttemptsLabel": "最大续写次数",
+    "autoResumeAttemptsDesc": "单次请求最多触发几轮续写。",
+    "loginEncryptionDesc": "对 /api/v0/users/* 的 POST（含登录）按官方客户端加密。"
   },
   "logs": {
     "title": "日志",

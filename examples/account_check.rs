@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             os: config.ds_core.client_os.clone(),
         };
 
-        match client.login(&payload).await {
+        match client.login(&payload, false, None).await {
             Ok(data) => {
                 let chat = data.user.chat.as_ref();
                 let muted = chat.is_some_and(|c| c.is_muted != 0);

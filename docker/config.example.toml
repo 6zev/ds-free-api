@@ -177,6 +177,56 @@ port = 22217
 # 需要更高吞吐请**增加账号数量**，而不是抬高这个值。
 # hourly_request_quota = 60
 
+# 同一账号两次请求之间的最小间隔秒数（0 = 不限制，默认 0）
+#
+# 每小时总量只是「量」，上游同时看「时间分布」：真实用户在一台设备上
+# 发消息是稀疏且不规律的，而代理池连续秒级一问一答是明显的机器节奏。
+# 开启后调度器会跳过尚未到间隔的账号，并在间隔上叠加 0~40% 的随机抖动，
+# 使「同一设备两次消息的间隔」不再恒定。多账号池建议 60~300。
+#
+# 注意：这会直接降低单账号的可用频率 —— 并发靠的是账号数量，不是压榨单个账号。
+# request_min_interval_secs = 0
+#
+# ── 长思考保护（心跳 + 截断续写）────────────────────────────────────────
+#
+# 上游在长时间思考后会直接关闭 SSE（`event: close` 带 `auto_resume`）或下发
+# `status = INCOMPLETE`，旧行为是当成正常结束 —— 用户只看到「思考完没答案」。
+# 心跳可在纯思考静默期保活连接，续写让流层自动接着生成：
+#
+# thinking_heartbeat_secs：纯思考静默期向客户端发送心跳注释行（0 = 关闭）
+# on_truncation：检测到截断时自动续写（默认关闭，观察后再开）
+# max_attempts：单次请求最多续写几轮
+# empty_prompt：续写时发空 prompt（让上游接着写），false 则发 "continue"
+#
+# [ds_core.auto_resume]
+# thinking_heartbeat_secs = 0
+# on_truncation = false
+# max_attempts = 2
+# empty_prompt = true
+#
+# ── 登录请求加密 ──────────────────────────────────────────────────────
+#
+# 官方客户端对 /api/v0/users/* 的 POST（含 login）会做 AES-128-CBC 加密，
+# 密钥用 RSA-OAEP-SHA256 包裹成 x-request-encryption-key 头。关闭后回到明文
+# 登录（可绕过加密链做调试）。默认开启，与官方客户端一致。
+#
+# login_encryption = true
+
+# ── 账号设备身份（device_id）───────────────────────────────────────────
+#
+# 上游要求登录携带浏览器注册过的数美 device_id，缺失会直接以
+# RISK_DEVICE_DETECTED(biz_code=11) 拒绝；**多个账号复用同一个 device_id**
+# 则会让上游把它们聚成同一台设备，禁言风险显著升高。
+#
+# 因此每个 [[accounts]] 都应填写从**真实浏览器登录请求**里抓到的、互不相同的
+# device_id（抓取方法见 docs/development.md 与 scripts/risk-experiment/）。
+# 本代理的 X-Device-Id 头与 x-hif-leim 令牌都按该 device_id 逐账号派生。
+#
+# 只有当你确实想让所有账号共用一台设备的身份时，才设置下面的全局
+# client_device_id；两者都没有时账号初始化会报错提示补齐，而不是偷偷
+# 派生一个所有账号共用的假身份。
+# client_device_id = ""
+
 # ── 搜索模式默认值 ─────────────────────────────────────────────────────
 #
 # 请求未携带 web_search_options 时，是否默认开启 DeepSeek 的搜索模式。

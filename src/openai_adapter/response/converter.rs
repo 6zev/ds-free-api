@@ -94,6 +94,8 @@ where
         loop {
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(event))) => match event {
+                    // 纯思考静默期的保活心跳：不改变任何语义，上层序列化为 SSE 注释行
+                    StreamEvent::Ping => continue,
                     StreamEvent::Meta { .. } => {
                         trace!(target: "adapter", ">>> conv: role=assistant");
                         *this.role_sent = true;

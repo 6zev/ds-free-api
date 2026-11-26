@@ -47,6 +47,42 @@ pub struct DsCoreConfig {
     pub input_character_limits: Vec<u32>,
     /// 每账号每小时请求上限（0 = 不限制）
     pub hourly_request_quota: u64,
+    /// 同一账号两次请求之间的最小间隔秒数（0 = 不限制）
+    ///
+    /// 真实用户在一台设备上发消息的间隔远大于代理池的瞬时间隔；恒定速率的
+    /// 「指令 → 回答」循环是明显的机器特征。启用后账号调度会跳过尚未到间隔的
+    /// 账号，并在间隔上叠加随机抖动（见 `pool` 模块的 `INTERVAL_JITTER_PERMILLE`）。
+    pub request_min_interval_secs: u64,
+    /// 长思考保护：心跳 + 截断续写
+    pub auto_resume: AutoResumeConfig,
+    /// 登录请求体是否做客户端加密（默认 true）
+    ///
+    /// 上游 2026-10 起 `POST /api/v0/users/login` 不再接受 JSON 明文，必须发
+    /// AES-128-CBC 密文 + `x-request-encryption-key` 头，否则 422（issue #118）。
+    /// 仅在调试明文 body 时关闭。
+    pub login_encryption: bool,
+}
+
+/// 长思考保护配置（心跳 + 截断续写）
+#[derive(Debug, Clone, Default)]
+pub struct AutoResumeConfig {
+    /// 纯 thinking 静默期下发 SSE 注释心跳的间隔秒数（0 = 关闭，默认 0）
+    ///
+    /// 上游长思考时可能长时间不吐帧，客户端与代理之间的 nginx/CDN 会因「无字节」
+    /// 先断开。启用后仅在上游 `Poll::Pending` 且处于思考阶段时，每 N 秒下发一条
+    /// `: ping` 注释行（OpenAI/Anthropic 客户端都会忽略），不改变任何语义。
+    pub thinking_heartbeat_secs: u64,
+    /// 检测到「疑似被上游截断」时是否自动续写（默认 false）
+    ///
+    /// 判定条件见 `chat::response` 模块：已有思考内容但没有正文，且上游状态不是
+    /// FINISHED（INCOMPLETE / WIP / 缺失），或 `event: close` 携带 `auto_resume=true`。
+    /// 续写 = 同一 `chat_session_id` + `parent_message_id` 指向被截断的响应。
+    /// **空 prompt 续写尚未用真实账号验证**，默认关闭以免污染对话。
+    pub on_truncation: bool,
+    /// 自动续写的最大次数（默认 2；0 = 不续写）
+    pub max_attempts: u32,
+    /// `true` = 续写用空 prompt（让服务端接着生成）；`false` = 发一条 `"continue"`
+    pub empty_prompt: bool,
 }
 
 /// 单个账号配置

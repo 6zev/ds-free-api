@@ -560,7 +560,7 @@ export function SettingsPage() {
             <span>{t('settings.quota')}</span>
           </CardTitle>
           <CardDescription className="text-xs">
-            {t('settings.searchModeDesc')}
+            {t('settings.quotaDesc')}
           </CardDescription>
         </CardHeader>
         <CardContent className="pt-2 space-y-4">
@@ -578,6 +578,92 @@ export function SettingsPage() {
               className="font-mono text-xs"
             />
             <p className="text-[11px] text-muted-foreground mt-1.5">{t('settings.quotaDesc')}</p>
+          </div>
+          <div>
+            <label htmlFor="set-min-interval" className="text-xs font-medium text-muted-foreground block mb-1.5">
+              {t('settings.minIntervalLabel')}
+            </label>
+            <Input
+              id="set-min-interval"
+              type="number"
+              min={0}
+              value={config.ds_core.request_min_interval_secs}
+              onChange={(e) =>
+                update(['ds_core', 'request_min_interval_secs'], Number(e.target.value))
+              }
+              className="font-mono text-xs"
+            />
+            <p className="text-[11px] text-muted-foreground mt-1.5">{t('settings.minIntervalDesc')}</p>
+          </div>
+          <div>
+            <label htmlFor="set-heartbeat" className="text-xs font-medium text-muted-foreground block mb-1.5">
+              {t('settings.heartbeatLabel')}
+            </label>
+            <Input
+              id="set-heartbeat"
+              type="number"
+              min={0}
+              value={config.ds_core.auto_resume.thinking_heartbeat_secs}
+              onChange={(e) =>
+                update(['ds_core', 'auto_resume', 'thinking_heartbeat_secs'], Number(e.target.value) || 0)
+              }
+              className="font-mono text-xs"
+            />
+            <p className="text-[11px] text-muted-foreground mt-1.5">{t('settings.heartbeatDesc')}</p>
+          </div>
+          <div>
+            <label
+              htmlFor="set-auto-resume"
+              className="flex items-center gap-3 cursor-pointer select-none"
+            >
+              <input
+                id="set-auto-resume"
+                type="checkbox"
+                checked={config.ds_core.auto_resume.on_truncation}
+                onChange={(e) =>
+                  update(['ds_core', 'auto_resume', 'on_truncation'], e.target.checked)
+                }
+                className="h-4 w-4 rounded border-input accent-primary cursor-pointer"
+              />
+              <span className="text-xs font-mono">
+                on_truncation = {String(config.ds_core.auto_resume.on_truncation)}
+              </span>
+            </label>
+            <p className="text-[11px] text-muted-foreground mt-1.5">{t('settings.autoResumeDesc')}</p>
+          </div>
+          <div>
+            <label htmlFor="set-auto-resume-attempts" className="text-xs font-medium text-muted-foreground block mb-1.5">
+              {t('settings.autoResumeAttemptsLabel')}
+            </label>
+            <Input
+              id="set-auto-resume-attempts"
+              type="number"
+              min={0}
+              value={config.ds_core.auto_resume.max_attempts}
+              onChange={(e) =>
+                update(['ds_core', 'auto_resume', 'max_attempts'], Number(e.target.value) || 0)
+              }
+              className="font-mono text-xs"
+            />
+            <p className="text-[11px] text-muted-foreground mt-1.5">{t('settings.autoResumeAttemptsDesc')}</p>
+          </div>
+          <div>
+            <label
+              htmlFor="set-login-encryption"
+              className="flex items-center gap-3 cursor-pointer select-none"
+            >
+              <input
+                id="set-login-encryption"
+                type="checkbox"
+                checked={config.ds_core.login_encryption}
+                onChange={(e) => update(['ds_core', 'login_encryption'], e.target.checked)}
+                className="h-4 w-4 rounded border-input accent-primary cursor-pointer"
+              />
+              <span className="text-xs font-mono">
+                login_encryption = {String(config.ds_core.login_encryption)}
+              </span>
+            </label>
+            <p className="text-[11px] text-muted-foreground mt-1.5">{t('settings.loginEncryptionDesc')}</p>
           </div>
           <label
             htmlFor="set-default-search"

@@ -26,6 +26,10 @@ pub struct Config {
 
 /// DeepSeek 核心配置段 —— 对应 config.toml 的 [ds_core]
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "配置段直接对应 TOML 开关，拆结构体会破坏用户手写配置的平铺布局"
+)]
 pub struct DsCoreSection {
     /// 账号池（必需，可为空——启动后通过管理面板添加）
     #[serde(default)]
@@ -120,6 +124,26 @@ pub struct DsCoreSection {
     /// 由池中其他账号承接；所有账号都超限时返回 429（而非继续硬打上游）。
     #[serde(default = "default_hourly_request_quota")]
     pub hourly_request_quota: u64,
+    /// 同一账号两次请求之间的最小间隔秒数（0 = 不限制，默认 0）
+    ///
+    /// 账号调度会跳过尚未到间隔的账号，并在间隔上叠加随机抖动，避免上游看到
+    /// 「同一设备恒速发消息」这种机器节奏。禁言是延迟判定的 —— 单看每小时
+    /// 总量不够，**时间分布**同样是特征。多账号池建议设为 60~300。
+    #[serde(default = "default_request_min_interval_secs")]
+    pub request_min_interval_secs: u64,
+    /// 纯 thinking 静默期下发 SSE 注释心跳的间隔秒数（0 = 关闭，默认 0）
+    ///
+    /// 上游长思考时会连续数十秒不吐帧；客户端与本代理之间的 nginx / CDN
+    /// （`proxy_read_timeout`、idle timeout）可能先断开。启用后在上游无字节且
+    /// 长思考保护（心跳 + 截断续写）
+    #[serde(default)]
+    pub auto_resume: AutoResumeSection,
+    /// 登录请求体是否做客户端加密（默认 true）
+    ///
+    /// 上游 2026-10 起 `users/login` 只接受 AES-128-CBC 密文 + `x-request-encryption-key`
+    /// 头，明文 JSON 会 422（issue #118）。仅在抓包调试时关闭。
+    #[serde(default = "default_login_encryption")]
+    pub login_encryption: bool,
     /// 未显式传入 `web_search_options` 时是否默认开启搜索模式（默认 true）
     ///
     /// `true` 保持历史行为（始终搜索）；设为 `false` 则严格遵循 OpenAI 语义
@@ -283,6 +307,15 @@ const fn default_hourly_request_quota() -> u64 {
     60
 }
 
+/// 同一账号两次请求最小间隔默认值
+///
+/// 默认 0（不限制）以免改变既有部署的行为；这只是一个**安全护栏**，
+/// 真正降低禁言率的做法是把账号数量铺开、让每个账号的请求随时间均匀分布。
+/// 需要压制突发流量时可设为 60~300 秒。
+const fn default_request_min_interval_secs() -> u64 {
+    0
+}
+
 /// 未传 `web_search_options` 时默认是否开启搜索模式。
 ///
 /// 默认 `false`（对齐浏览器）：官方客户端只有用户**显式打开**联网搜索才会搜索。
@@ -359,6 +392,29 @@ const fn default_hif_enabled() -> bool {
 /// 账号可用性仍由登录成功 + 禁言早检（biz_code 5）保证；需要旧行为可显式设为 `true`。
 const fn default_startup_health_check() -> bool {
     false
+}
+
+/// 思考阶段 SSE 心跳间隔（默认 0 = 关闭，保持历史行为）
+const fn default_thinking_heartbeat_secs() -> u64 {
+    0
+}
+
+/// 截断自动续写开关（默认 false，避免未验证的空 prompt 续写污染会话）
+const fn default_auto_resume_on_truncation() -> bool {
+    false
+}
+
+const fn default_auto_resume_max_attempts() -> u32 {
+    2
+}
+
+const fn default_auto_resume_empty_prompt() -> bool {
+    true
+}
+
+/// 登录加密（默认 true：上游 2026-10 起强制）
+const fn default_login_encryption() -> bool {
+    true
 }
 
 /// 会话策略：默认 `reuse`（对齐真实客户端）
@@ -564,6 +620,9 @@ impl Default for DsCoreSection {
             model_aliases: Vec::new(),
             tool_call: ToolCallTagConfig::default(),
             hourly_request_quota: default_hourly_request_quota(),
+            request_min_interval_secs: default_request_min_interval_secs(),
+            auto_resume: AutoResumeSection::default(),
+            login_encryption: default_login_encryption(),
             default_search_enabled: default_search_enabled(),
             responses_store_capacity: default_responses_store_capacity(),
             responses_store_ttl_secs: default_responses_store_ttl_secs(),
@@ -584,4 +643,37 @@ pub enum ConfigError {
     Cli(String),
     #[error("TOML 序列化错误: {0}")]
     TomlSerialization(#[from] toml::ser::Error),
+}
+
+/// 长思考保护配置段 —— 对应 config.toml 的 `[ds_core.auto_resume]`
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AutoResumeSection {
+    /// 纯 thinking 静默期下发 `: ping` 心跳的间隔秒数（0 = 关闭，默认 0）
+    #[serde(default = "default_thinking_heartbeat_secs")]
+    pub thinking_heartbeat_secs: u64,
+    /// 检测到「疑似被上游截断」时是否自动续写（默认 false）
+    ///
+    /// 截断 = 已有思考内容但无正文，且上游状态不是 FINISHED，或 `event: close`
+    /// 携带 `auto_resume=true`。续写复用同一 `chat_session_id` 并把
+    /// `parent_message_id` 指向被截断的响应。**空 prompt 续写尚未用真实账号
+    /// 验证**，默认关闭；开启前请先用单账号 A/B 确认上游会接着生成。
+    #[serde(default = "default_auto_resume_on_truncation")]
+    pub on_truncation: bool,
+    /// 自动续写的最大次数（默认 2；0 = 不续写）
+    #[serde(default = "default_auto_resume_max_attempts")]
+    pub max_attempts: u32,
+    /// `true` = 续写发空 prompt（让服务端接着生成）；`false` = 发一条 `"continue"`
+    #[serde(default = "default_auto_resume_empty_prompt")]
+    pub empty_prompt: bool,
+}
+
+impl Default for AutoResumeSection {
+    fn default() -> Self {
+        Self {
+            thinking_heartbeat_secs: default_thinking_heartbeat_secs(),
+            on_truncation: default_auto_resume_on_truncation(),
+            max_attempts: default_auto_resume_max_attempts(),
+            empty_prompt: default_auto_resume_empty_prompt(),
+        }
+    }
 }

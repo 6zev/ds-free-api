@@ -5,6 +5,7 @@
 
 mod request;
 mod response;
+mod resume;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12,11 +13,11 @@ use std::sync::{Arc, Mutex};
 use futures::future::join_all;
 
 use crate::accounts::{Accounts, StopStreamPayload};
-use crate::config::DsCoreConfig;
+use crate::config::{AutoResumeConfig, DsCoreConfig};
 use response::ActiveSession;
 
 pub use request::{ChatRequest, ChatResponse, DeltaPrompt, FilePayload};
-pub use response::StreamEvent;
+pub use response::{StreamEvent, StreamOutcome};
 
 /// 一次请求的会话决策
 struct SessionPlan {
@@ -37,6 +38,8 @@ pub struct Chat {
     input_character_limits: Vec<u32>,
     /// 是否复用账号会话（真实客户端一个会话长期复用；默认关闭 = 每轮建删）
     session_reuse: bool,
+    /// 长思考保护（心跳 + 截断续写）
+    auto_resume: AutoResumeConfig,
 }
 
 impl Chat {
@@ -48,6 +51,7 @@ impl Chat {
             model_types: config.model_types.clone(),
             input_character_limits: config.input_character_limits.clone(),
             session_reuse: config.session_policy == "reuse",
+            auto_resume: config.auto_resume.clone(),
         }
     }
 

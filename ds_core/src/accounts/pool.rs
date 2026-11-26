@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use dashmap::DashMap;
+use fastrand::Rng;
 use futures::TryStreamExt;
 use futures::future::join_all;
 use log::{debug, error, info, warn};
@@ -128,6 +129,12 @@ pub struct Account {
     /// X-Device-Id」，HIF 风控令牌也按设备下发；这里按账号派生，
     /// 避免多账号共用同一设备身份与同一令牌。
     client: DsClient,
+    /// 下一条请求最早可发出的 Unix ms（`request_min_interval_secs` 的节流闸门）
+    ///
+    /// 0 = 尚未发放过请求。每次分配账号后写入「本次发放时刻 + 带抖动的间隔」，
+    /// 下一次选号时 `now < next_request_at` 的账号直接跳过 —— 上游看到的永远是
+    /// 「同一设备两次发消息之间隔得够久且不固定」的节奏，而不是恒定速率的机器流量。
+    next_request_at: AtomicI64,
 }
 
 /// 复用会话槽里的一条记录
@@ -148,6 +155,15 @@ const MAX_ERROR_COUNT: u8 = 3;
 
 /// 配额窗口长度：1 小时
 const WINDOW_SECS: i64 = 3600;
+
+/// 两次请求之间的最小间隔抖动上限，单位千分比（400 = 最多再加 40%）
+///
+/// 真实客户端里两次「发消息」的间隔是**间隔不一**的（读答案、打字、切标签页），
+/// 而不是像本代理一样卡着一个固定节奏。固定节奏本身就是一个很好识别的机器特征：
+/// 每次间隔都恰好等于阈值（±0s），比「平均 10 分钟、方差很大」要可疑得多。
+/// 因此实际等待时长取 `base ~ base * (1 + JITTER_PERMILLE / 1000)` 之间的随机值。
+/// 用整数千分比而非 `f64`，是为了让间隔计算全程留在整数域（不引入精度告警）。
+const INTERVAL_JITTER_PERMILLE: i64 = 400;
 
 fn now_secs() -> i64 {
     unix_timestamp_secs().unwrap_or(i64::MAX)
@@ -373,6 +389,41 @@ impl Account {
         }
     }
 
+    /// 该账号此刻是否已过最小间隔闸门
+    fn pacing_ready(&self, now_ms: i64) -> bool {
+        now_ms >= self.next_request_at.load(Ordering::Relaxed)
+    }
+
+    /// 记录本次发放，并把下一次可用时间推到「带抖动的间隔」之后
+    ///
+    /// `base_secs == 0` 表示不限速，清空闸门。返回本账号到下一次可用的剩余毫秒数
+    /// （`base_secs == 0` 时为 0），供调用方判断「是立刻分配还是需要等最早可用账号」。
+    fn arm_pacing(&self, base_secs: u64, rng: &mut Rng, now_ms: i64) -> i64 {
+        if base_secs == 0 {
+            self.next_request_at.store(0, Ordering::Relaxed);
+            return 0;
+        }
+        // 间隔 = base + [0, base*ratio)，全部在整数域内算完再转换，
+        // 避免 f64↔i64 往返触发精度/截断告警
+        let base_ms = i64::try_from(base_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+        let jitter_max_ms = base_ms
+            .saturating_mul(INTERVAL_JITTER_PERMILLE)
+            .saturating_div(1000);
+        let jitter_ms = rng.i64(0..=jitter_max_ms);
+        let wait = base_ms.saturating_add(jitter_ms);
+        self.next_request_at
+            .store(now_ms.saturating_add(wait), Ordering::Relaxed);
+        wait
+    }
+
+    /// 剩余等待毫秒数（已过闸门则为 0）
+    fn pacing_remaining_ms(&self, now_ms: i64) -> i64 {
+        self.next_request_at
+            .load(Ordering::Relaxed)
+            .saturating_sub(now_ms)
+            .max(0)
+    }
+
     /// 创建一个 Invalid 状态的账号（初始化失败时使用，仍加入池以便前台展示）
     fn new_invalid(creds: AccountConfig, _hourly_quota: u64, client: &DsClient) -> Self {
         let scoped = client.scoped_to(&account_x_device_id(&creds, client));
@@ -387,6 +438,7 @@ impl Account {
             window: SlidingWindowRateLimiter::new(),
             session: Mutex::new(None),
             client: scoped,
+            next_request_at: AtomicI64::new(0),
         }
     }
 
@@ -441,12 +493,19 @@ impl Drop for AccountGuard {
 pub struct AccountPool {
     /// 每账号每小时请求上限（0 = 不限制）
     hourly_quota: u64,
+    /// 同一账号两次请求之间的最小间隔秒数（0 = 不限制，保持历史行为）
+    ///
+    /// 来自 `request_min_interval_secs`。真实用户在同一台设备上发消息的节奏
+    /// 远低于代理池的瞬时吞吐；固定高频的「一问一答」本身就是机器特征。
+    request_min_interval_secs: u64,
     /// 启动时是否用一条 completion 做健康检查（false = 对齐真实客户端启动序列）
     startup_health_check: bool,
     /// 是否复用账号会话（false = 每轮建删，历史行为）
     session_reuse: bool,
     /// 复用模式下会话的空闲回收秒数（0 = 只在进程退出时删除）
     session_idle_secs: u64,
+    /// 登录请求体是否做客户端加密（上游 2026-10 起强制，默认 true）
+    login_encryption: bool,
     /// key = display_id (email or mobile), value = Account
     accounts: DashMap<String, Arc<Account>>,
     client: RwLock<Option<DsClient>>,
@@ -488,14 +547,30 @@ impl AccountPool {
     pub fn new(hourly_quota: u64, startup_health_check: bool) -> Self {
         Self {
             hourly_quota,
+            request_min_interval_secs: 0,
             startup_health_check,
             // 默认保持历史行为：不复用会话（每轮建删）
             session_reuse: false,
             session_idle_secs: 0,
+            login_encryption: true,
             accounts: DashMap::new(),
             client: RwLock::new(None),
             solver: RwLock::new(None),
         }
+    }
+
+    /// 配置同一账号两次请求的最小间隔（秒，0 = 关闭）
+    #[must_use]
+    pub const fn with_request_min_interval(mut self, secs: u64) -> Self {
+        self.request_min_interval_secs = secs;
+        self
+    }
+
+    /// 配置登录请求体是否加密（上游 2026-10 起强制，默认开启）
+    #[must_use]
+    pub const fn with_login_encryption(mut self, enabled: bool) -> Self {
+        self.login_encryption = enabled;
+        self
     }
 
     /// 配置会话复用策略（链式调用，默认关闭）
@@ -560,6 +635,7 @@ impl AccountPool {
                 let solver = solver.clone();
                 let sem = semaphore.clone();
                 let startup_health_check = self.startup_health_check;
+                let login_encryption = self.login_encryption;
                 async move {
                     let _permit = sem.acquire().await.expect("信号量未关闭");
                     let display_id = if creds.email.is_empty() {
@@ -567,8 +643,15 @@ impl AccountPool {
                     } else {
                         creds.email.clone()
                     };
-                    let account =
-                        match init_account(&creds, &client, &solver, startup_health_check).await {
+                    let account = match init_account(
+                        &creds,
+                        &client,
+                        &solver,
+                        startup_health_check,
+                        login_encryption,
+                    )
+                    .await
+                    {
                         Ok(account) => {
                             info!(target: "ds_core::accounts", "Account {display_id} initialized successfully");
                             account
@@ -621,7 +704,14 @@ impl AccountPool {
             return Err(PoolError::AlreadyExists(display_id));
         }
 
-        let account = init_account(creds, client, solver, self.startup_health_check).await?;
+        let account = init_account(
+            creds,
+            client,
+            solver,
+            self.startup_health_check,
+            self.login_encryption,
+        )
+        .await?;
         let _id = account.display_id().to_string();
         self.accounts.insert(display_id.clone(), Arc::new(account));
         info!(target: "ds_core::accounts", "Account {display_id} added dynamically");
@@ -657,26 +747,35 @@ impl AccountPool {
             if let Some(g) = self.get_account() {
                 return Some(g);
             }
-            if tokio::time::Instant::now() >= deadline {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
                 return None;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // 所有账号都只是「间隔未到」时按最早可用时刻精确等待；
+            // 不存在可恢复账号（全 Invalid / 配额全满）则立即放弃，避免空转到超时。
+            let wait_ms = self.next_available_wait_ms()?;
+            let remaining = deadline.saturating_duration_since(now);
+            let sleep = remaining.min(std::time::Duration::from_millis(wait_ms));
+            tokio::time::sleep(sleep).await;
         }
     }
-
     /// 获取空闲最久的可用账号（不等待，立即返回）
     ///
-    /// 遍历所有账号，选冷却已过且空闲时间最长的那个，最大化每次使用间隔。
+    /// 遍历所有账号，选冷却已过、配额未满、且已过最小间隔闸门的账号中
+    /// 「可用时间最早」的那个，最大化同一设备两次消息之间的间隔。
+    /// 所有账号都在间隔冷却中时返回 `None` —— 由 `get_account_with_wait`
+    /// 按最早可用时间精确等待，而不是用固定步长轮询空转。
     /// DashMap 无锁读，不阻塞并发请求。
     pub fn get_account(&self) -> Option<AccountGuard> {
         if self.accounts.is_empty() {
             return None;
         }
 
-        let now_ms = now_ms();
+        let now = now_ms();
+        let mut rng = Rng::new();
 
         let mut best: Option<Arc<Account>> = None;
-        let mut best_idle = i64::MIN;
+        let mut best_score = i64::MIN;
 
         for entry in &self.accounts {
             let account = entry.value();
@@ -692,9 +791,19 @@ impl AccountPool {
                 );
                 continue;
             }
-            let idle = now_ms - account.last_released.load(Ordering::Relaxed);
-            if idle > best_idle {
-                best_idle = idle;
+            let idle = now - account.last_released.load(Ordering::Relaxed);
+            // 还在最小间隔闸门内：跳过（score 用 next_request_at，越小越先可用）
+            if !account.pacing_ready(now) {
+                continue;
+            }
+            // 已在同一秒内等长空闲时，优先尚未排队的账号，避免总是砸在同一个上
+            let score = if self.request_min_interval_secs == 0 {
+                idle
+            } else {
+                idle.saturating_add(account.pacing_remaining_ms(now))
+            };
+            if score > best_score {
+                best_score = score;
                 best = Some(Arc::clone(account));
             }
         }
@@ -710,15 +819,44 @@ impl AccountPool {
             )
             .ok()?;
         account.record_request(self.hourly_quota);
+        let wait = account.arm_pacing(self.request_min_interval_secs, &mut rng, now);
         debug!(
             target: "ds_core::accounts",
-            "Account {} allocated for request (used_this_window={}, total={}, idle_ms={})",
+            "Account {} allocated for request (used_this_window={}, total={}, idle_ms={}, next_slot_ms={})",
             account.display_id(),
             account.window.used(),
             account.get_total_requests(),
-            now_ms - account.last_released.load(Ordering::Relaxed)
+            now - account.last_released.load(Ordering::Relaxed),
+            wait
         );
         Some(AccountGuard { account })
+    }
+
+    /// 最早一个「配额未满、状态空闲」账号还要等多久（ms），用于精确休眠
+    ///
+    /// 返回 `None` 表示不存在可恢复的账号（全部 Invalid / 配额全满），
+    /// 调用方应立即放弃，不再空等。
+    fn next_available_wait_ms(&self) -> Option<u64> {
+        if self.accounts.is_empty() {
+            return None;
+        }
+        let now = now_ms();
+        let mut min_wait: Option<i64> = None;
+        let mut has_usable = false;
+        for entry in &self.accounts {
+            let account = entry.value();
+            if !account.is_available() || !account.within_quota(self.hourly_quota) {
+                continue;
+            }
+            has_usable = true;
+            let wait = account.pacing_remaining_ms(now);
+            min_wait = Some(min_wait.map_or(wait, |m| m.min(wait)));
+        }
+        if !has_usable {
+            return None;
+        }
+        // 至少睡 50ms，避免边界情况下零间隔自旋
+        Some(u64::try_from(min_wait.unwrap_or(0).max(50)).unwrap_or(50))
     }
 
     /// 获取所有账号的详细状态
@@ -786,7 +924,14 @@ impl AccountPool {
             ));
         }
 
-        Self::re_login_account(&account, &client, &solver, self.startup_health_check).await;
+        Self::re_login_account(
+            &account,
+            &client,
+            &solver,
+            self.startup_health_check,
+            self.login_encryption,
+        )
+        .await;
 
         // 检查重登后状态
         let new_state = account.state();
@@ -818,9 +963,18 @@ impl AccountPool {
         client: &DsClient,
         solver: &PowSolver,
         startup_health_check: bool,
+        login_encryption: bool,
     ) {
         let display_id = account.display_id().to_string();
-        match try_init_account(&account.creds, client, solver, startup_health_check).await {
+        match try_init_account(
+            &account.creds,
+            client,
+            solver,
+            startup_health_check,
+            login_encryption,
+        )
+        .await
+        {
             Ok(new_account) => {
                 // 更新 token
                 *account.token.write().unwrap() = new_account.token.read().unwrap().clone();
@@ -875,6 +1029,7 @@ impl AccountPool {
                             &client,
                             &solver,
                             pool.startup_health_check,
+                            pool.login_encryption,
                         )
                         .await;
                     }
@@ -942,16 +1097,37 @@ async fn init_account(
     client: &DsClient,
     solver: &PowSolver,
     startup_health_check: bool,
+    login_encryption: bool,
 ) -> Result<Account, PoolError> {
-    try_init_account(creds, client, solver, startup_health_check).await
+    try_init_account(
+        creds,
+        client,
+        solver,
+        startup_health_check,
+        login_encryption,
+    )
+    .await
+}
+
+/// guest PoW：真实客户端 login 前向 `create_pow_challenge` 拿 guest challenge
+///
+/// 与 completion 的认证 PoW 不同，登录前没有 token，请求不带 Authorization。
+/// 解出的 header 写入 `x-ds-challenge-response`。
+async fn solve_guest_pow(client: &DsClient, solver: &PowSolver) -> Result<String, PoolError> {
+    let challenge = client
+        .create_guest_pow_challenge("/api/v0/users/login")
+        .await?;
+    Ok(solver.solve(&challenge)?.to_header())
 }
 
 /// 账号的 X-Device-Id
 ///
 /// - 有数美 `device_id` 时按其派生：稳定、且**每个账号各不相同**（对齐真实客户端
 ///   「一个浏览器 profile 一个设备」）；
-/// - 显式配置了全局 `client_device_id` 时以配置为准（多账号共用一台设备的场景）；
-/// - 都没有时回退到客户端自身的设备身份。
+/// - 账号没有 `device_id` 但配置了全局 `client_device_id` 时以配置为准
+///   （多账号共用一台设备的场景）；
+/// - 都没有时返回**空串**，调用方据此告警：绝不能给所有账号共用一个派生假身份，
+///   那等于把全部账号在上游侧聚成同一台设备。
 fn account_x_device_id(creds: &AccountConfig, client: &DsClient) -> String {
     if !creds.device_id.trim().is_empty() {
         return super::client::derive_device_uuid(
@@ -966,6 +1142,7 @@ async fn try_init_account(
     client: &DsClient,
     solver: &PowSolver,
     startup_health_check: bool,
+    login_encryption: bool,
 ) -> Result<Account, PoolError> {
     // 验证：email 和 mobile 至少一个非空
     if creds.email.is_empty() && creds.mobile.is_empty() {
@@ -974,8 +1151,17 @@ async fn try_init_account(
         ));
     }
 
-    // 设备身份按账号派生（空 device_id 时回退到全局配置的 X-Device-Id）
+    // 设备身份按账号派生（账号 device_id 优先 → 全局 client_device_id → 空）
     let x_device_id = account_x_device_id(creds, client);
+    if x_device_id.trim().is_empty() {
+        error!(
+            target: "ds_core::accounts",
+            "Account {} has no device_id and no client_device_id fallback is configured; \
+             login will be rejected upstream as RISK_DEVICE_DETECTED. \
+             Set the account device_id to the value captured from a real browser login.",
+            display_id_of(creds)
+        );
+    }
     let client = &client.scoped_to(&x_device_id);
     // 真实客户端在启动时就取好该设备的 HIF 令牌；这里同样预热，
     // 失败不阻断（与客户端轮询失败时的行为一致）
@@ -990,7 +1176,26 @@ async fn try_init_account(
         os: client.client_os().to_string(),
     };
 
-    let login_data = client.login(&login_payload).await?;
+    // guest PoW：真实客户端在 login 前先解一次 guest challenge（`x-ds-challenge-response`）。
+    // 失败不阻断 login 本身（加密已能让 body 过校验），但会在日志里留痕。
+    let guest_pow = if login_encryption {
+        match solve_guest_pow(client, solver).await {
+            Ok(h) => Some(h),
+            Err(e) => {
+                debug!(
+                    target: "ds_core::accounts",
+                    "login guest PoW 未取得（继续不带该头发送）: {e}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let login_data = client
+        .login(&login_payload, login_encryption, guest_pow.as_deref())
+        .await?;
     debug!(
         target: "ds_core::client",
         "登录响应: code={}, msg={}, user_id={}, email={:?}, mobile={:?}, muted={:?}, mute_until={:?}",
@@ -1103,6 +1308,7 @@ async fn try_init_account(
         window: SlidingWindowRateLimiter::new(),
         session: Mutex::new(None),
         client: client.clone(),
+        next_request_at: AtomicI64::new(0),
     })
 }
 
@@ -1249,9 +1455,60 @@ mod tests {
         assert_eq!(a1, a2, "同一账号的设备身份必须稳定");
         assert_ne!(a1, b, "不同账号不得共用同一个 X-Device-Id");
         assert_eq!(a1.len(), 36);
-        // 无 device_id 时回退到客户端自身身份
+        // 账号没有 device_id 时不得凭空造一个共用身份：回落到客户端自身的
+        // 设备身份（未配置则为空），由初始化阶段告警提示补齐真实 device_id。
         let fallback = account_x_device_id(&account("c@example.com", ""), &client);
         assert_eq!(fallback, client.device_id());
+        assert!(
+            fallback.is_empty(),
+            "未配置任何 device_id/设备身份时不得派生共用假身份"
+        );
+    }
+
+    #[test]
+    fn pacing_gate_blocks_until_interval_elapsed() {
+        let a = Account::new_invalid(account("a@example.com", "dev"), 0, &test_client());
+        let mut rng = Rng::new();
+        let now = 1_000_000;
+        // 未发放前闸门是开的
+        assert!(a.pacing_ready(now));
+        let wait = a.arm_pacing(60, &mut rng, now);
+        // 间隔落在 [60s, 84s) 之间
+        assert!((60_000..84_000).contains(&wait), "wait={wait}");
+        assert!(!a.pacing_ready(now + 59_000), "间隔未到不得放行");
+        assert!(a.pacing_ready(now + 90_000), "超过最大抖动后必须放行");
+    }
+
+    #[test]
+    fn pacing_jitter_is_not_constant() {
+        let a = Account::new_invalid(account("a@example.com", "dev"), 0, &test_client());
+        let mut rng = Rng::new();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..20 {
+            seen.insert(a.arm_pacing(60, &mut rng, 1_000_000 + i * 100_000));
+        }
+        assert!(
+            seen.len() > 1,
+            "抖动必须让每次间隔不同，否则就是恒定机器节奏"
+        );
+    }
+
+    #[test]
+    fn pacing_zero_disables_gate() {
+        let a = Account::new_invalid(account("a@example.com", "dev"), 0, &test_client());
+        let mut rng = Rng::new();
+        assert_eq!(a.arm_pacing(0, &mut rng, 5_000), 0);
+        assert!(a.pacing_ready(0), "0 = 不限制，任何时刻都可分配");
+    }
+
+    #[test]
+    fn pacing_remaining_never_negative() {
+        let a = Account::new_invalid(account("a@example.com", "dev"), 0, &test_client());
+        let mut rng = Rng::new();
+        a.arm_pacing(60, &mut rng, 1_000);
+        assert!(a.pacing_remaining_ms(1_000) > 0, "刚发放时必然还要等");
+        // 任何远超闸门时刻的时间戳都必须收敛到 0，不返回负数
+        assert_eq!(a.pacing_remaining_ms(10_000_000), 0);
     }
 
     #[test]
@@ -1432,6 +1689,7 @@ mod tests {
             window: SlidingWindowRateLimiter::new(),
             session: Mutex::new(None),
             client: test_client(),
+            next_request_at: AtomicI64::new(0),
         })
     }
 

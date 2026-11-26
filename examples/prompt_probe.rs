@@ -48,6 +48,11 @@ async fn main() -> anyhow::Result<()> {
         input_character_limits: config.ds_core.input_character_limits.clone(),
         // 探测工具会连续发请求做 A/B 对比，配额交给调用方自行控制
         hourly_request_quota: 0,
+        // 探测需要固定节奏，关闭最小间隔闸门
+        request_min_interval_secs: 0,
+        // 探测工具不关心思考心跳/续写
+        auto_resume: ds_core::AutoResumeConfig::default(),
+        login_encryption: true,
     };
     let accounts: Vec<AccountConfig> = config
         .ds_core
@@ -85,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
             model_type: model_type.clone(),
             files: vec![],
             delta: None,
+            resume: None,
         };
 
         let start = Instant::now();

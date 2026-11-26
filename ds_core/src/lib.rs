@@ -12,8 +12,8 @@ pub use accounts::{
     ChatSessionInfo, ClientIdentity, DsClient, EmulationProfile, FetchSessionsData, HifConfig,
     LoginPayload,
 };
-pub use chat::{ChatRequest, ChatResponse, DeltaPrompt, FilePayload, StreamEvent};
-pub use config::{AccountConfig, DsCoreConfig};
+pub use chat::{ChatRequest, ChatResponse, DeltaPrompt, FilePayload, StreamEvent, StreamOutcome};
+pub use config::{AccountConfig, AutoResumeConfig, DsCoreConfig};
 
 use accounts::Accounts;
 use chat::Chat;

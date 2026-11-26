@@ -9,7 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::handlers::AppState;
-use crate::config::Config;
+use crate::config::{AutoResumeSection, Config};
 
 // ── 请求/响应类型 ──────────────────────────────────────────────────────────
 
@@ -61,6 +61,10 @@ pub struct AdminConfigResponse {
 }
 
 #[derive(Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "管理面板往返 JSON 必须逐字段平铺，与 TOML 段一一对应"
+)]
 pub struct DsCoreView {
     pub accounts: Vec<AccountView>,
     pub api_base: String,
@@ -92,6 +96,11 @@ pub struct DsCoreView {
     pub tool_call: ToolCallTagConfigView,
     /// 每账号每小时请求上限（0 = 不限制）
     pub hourly_request_quota: u64,
+    /// 同账号两次请求的最小间隔秒数（0 = 不限制）
+    pub request_min_interval_secs: u64,
+    pub auto_resume: AutoResumeSection,
+    /// 是否对 `/api/v0/users/*` POST 做官方加密
+    pub login_encryption: bool,
     /// 未显式传 `web_search_options` 时是否默认开启搜索模式
     pub default_search_enabled: bool,
     /// Responses API `previous_response_id` 缓存条数上限
@@ -186,6 +195,9 @@ fn mask_config(config: &Config) -> AdminConfigResponse {
                 extra_ends: config.ds_core.tool_call.extra_ends.clone(),
             },
             hourly_request_quota: config.ds_core.hourly_request_quota,
+            request_min_interval_secs: config.ds_core.request_min_interval_secs,
+            auto_resume: config.ds_core.auto_resume.clone(),
+            login_encryption: config.ds_core.login_encryption,
             default_search_enabled: config.ds_core.default_search_enabled,
             responses_store_capacity: config.ds_core.responses_store_capacity,
             responses_store_ttl_secs: config.ds_core.responses_store_ttl_secs,
@@ -555,6 +567,14 @@ responses_store_capacity = 128
 responses_store_ttl_secs = 7200
 default_search_enabled = false
 hourly_request_quota = 42
+request_min_interval_secs = 120
+login_encryption = false
+
+[ds_core.auto_resume]
+thinking_heartbeat_secs = 15
+on_truncation = true
+max_attempts = 3
+empty_prompt = false
 
 [[ds_core.accounts]]
 email = "a@example.com"
@@ -664,6 +684,15 @@ description = "test"
         assert_eq!(json["ds_core"]["responses_store_ttl_secs"], 7200);
         assert_eq!(json["ds_core"]["default_search_enabled"], false);
         assert_eq!(json["ds_core"]["hourly_request_quota"], 42);
+        assert_eq!(json["ds_core"]["request_min_interval_secs"], 120);
+        assert_eq!(
+            json["ds_core"]["auto_resume"]["thinking_heartbeat_secs"],
+            15
+        );
+        assert_eq!(json["ds_core"]["auto_resume"]["on_truncation"], true);
+        assert_eq!(json["ds_core"]["auto_resume"]["max_attempts"], 3);
+        assert_eq!(json["ds_core"]["auto_resume"]["empty_prompt"], false);
+        assert_eq!(json["ds_core"]["login_encryption"], false);
     }
 
     #[test]

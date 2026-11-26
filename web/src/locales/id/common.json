@@ -193,7 +193,16 @@
     "sessionPolicy": "Kebijakan sesi",
     "sessionPolicyDesc": "Default reuse agar sama dengan klien resmi (satu sesi dipakai ulang terus-menerus); per_request = sesi baru per permintaan, dihapus saat stream selesai (perilaku lama). Semantik reuse belum diverifikasi dengan akun nyata.",
     "sessionIdleSecs": "Batas idle sesi yang dipakai ulang (detik, 0 = hapus hanya saat keluar)",
-    "quotaLabel": "Permintaan / jam / akun"
+    "quotaLabel": "Permintaan / jam / akun",
+    "minInterval": "Interval Minimum Permintaan per Akun",
+    "minIntervalDesc": "Detik minimum antar dua permintaan pada akun yang sama (0 = tanpa batas). Upstream melihat pola waktu selain volume: pengguna nyata mengirim pesan jarang dan tidak teratur, sedangkan ritme tanya-jawab yang konstan adalah sinyal mesin yang jelas. Saat diaktifkan, setiap interval mendapat jitter acak 0-40%. Untuk kumpulan multi-akun, 60-300 adalah rentang yang wajar.",
+    "minIntervalLabel": "Detik / permintaan / akun",
+    "heartbeatLabel": "Detak pemikiran (detik)",
+    "heartbeatDesc": "Kirim komentar SSE saat berpikir hening agar koneksi tetap hidup (0 = nonaktif).",
+    "autoResumeDesc": "Lanjutkan generasi otomatis saat upstream memotong giliran berpikir panjang.",
+    "autoResumeAttemptsLabel": "Batas percobaan lanjut",
+    "autoResumeAttemptsDesc": "Berapa kali lanjutan boleh dipicu per permintaan.",
+    "loginEncryptionDesc": "Enkripsi body POST /api/v0/users/* (termasuk login) seperti klien resmi."
   },
   "logs": {
     "title": "Log",

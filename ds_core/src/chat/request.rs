@@ -5,13 +5,14 @@
 //! - 分块路径（v0_chat_oversized_chunk）：超限 expert 模型，分块 completion 写入
 
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
 use crate::CoreError;
-use crate::accounts::CompletionPayload;
+use crate::accounts::{Accounts, CompletionPayload};
 
 use super::response::{
     ActiveSession, ResponseStream, SessionHandle, StreamEvent, check_hint, parse_json_error,
@@ -136,7 +137,7 @@ pub struct FilePayload {
 }
 
 /// 对话请求
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatRequest {
     /// 完整 prompt（新建会话时发送；含角色标签与历史）
     pub prompt: String,
@@ -150,6 +151,8 @@ pub struct ChatRequest {
     /// 提供该字段后，本代理在命中同一会话时可照此增量发送，避免把整段历史
     /// （连同 `<｜Role｜>` 标签）反复塞进 prompt。
     pub delta: Option<DeltaPrompt>,
+    /// 保留字段：自动续写由流内部调度，外部调用方保持 `None`
+    pub resume: Option<()>,
 }
 
 /// 增量 prompt：会话复用时只发新增内容
@@ -163,6 +166,7 @@ pub struct DeltaPrompt {
 
 /// v0_chat 返回值：精简协议事件流
 pub struct ChatResponse {
+    /// 对外暴露的事件流（供适配层直接消费）
     pub stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, CoreError>> + Send>>,
 }
 
@@ -225,6 +229,35 @@ impl Chat {
             }
         }
         Err(CoreError::Overloaded)
+    }
+
+    /// 给已建立的流安装截断续写回调（仅在配置开启时生效）
+    fn maybe_supervise(
+        &self,
+        mut inner: ResponseStream,
+        req: &ChatRequest,
+        request_id: &str,
+    ) -> ResponseStream {
+        if !self.auto_resume.on_truncation
+            || self.auto_resume.max_attempts == 0
+            || req.resume.is_some()
+        {
+            return inner;
+        }
+        // replier 需要持有状态（账号池 + 原请求），用 Arc<Mutex> 共享给闭包
+        let shared: SharedReplier = Arc::new(Mutex::new(Some((
+            self.accounts.clone(),
+            req.clone(),
+            request_id.to_string(),
+            self.auto_resume.empty_prompt,
+        ))));
+        let replier = build_replier(shared);
+        inner.install_resume(
+            replier,
+            self.auto_resume.max_attempts,
+            self.auto_resume.empty_prompt,
+        );
+        inner
     }
 
     /// 回退方案 A：历史文件上传（default / vision）
@@ -555,24 +588,27 @@ impl Chat {
             g.disarm();
         }
 
-        Ok(ChatResponse {
-            stream: Box::pin(ResponseStream::new(
-                Box::pin(stream),
-                guard,
-                SessionHandle {
-                    client: account.client(),
-                    token,
-                    session_id,
-                    message_id: stop_id,
-                    sessions: self.active_sessions.clone(),
-                    account: Some(account),
-                    keep_on_finish: self.session_reuse,
-                    // 分块路径不参与增量复用（见上面的 acquire_session(None)）
-                    chain: Vec::new(),
-                },
-                account_id.clone(),
-            )),
-        })
+        let inner = ResponseStream::new(
+            Box::pin(stream),
+            guard,
+            SessionHandle {
+                client: account.client(),
+                token,
+                session_id,
+                message_id: stop_id,
+                sessions: self.active_sessions.clone(),
+                account: Some(account),
+                keep_on_finish: self.session_reuse,
+                // 分块路径不参与增量复用（见上面的 acquire_session(None)）
+                chain: Vec::new(),
+            },
+            account_id.clone(),
+            self.auto_resume.thinking_heartbeat_secs,
+        );
+        let inner = self.maybe_supervise(inner, req, request_id);
+        let stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, CoreError>> + Send>> =
+            Box::pin(inner);
+        Ok(ChatResponse { stream })
     }
 
     /// 单次请求尝试（不含重试逻辑）
@@ -857,27 +893,140 @@ impl Chat {
             g.disarm();
         }
 
-        Ok(ChatResponse {
-            stream: Box::pin(ResponseStream::new(
-                Box::pin(stream),
-                guard,
-                SessionHandle {
-                    client: account.client(),
-                    token,
-                    session_id,
-                    message_id: stop_id,
-                    sessions: self.active_sessions.clone(),
-                    account: Some(account),
-                    keep_on_finish: self.session_reuse,
-                    chain: req
-                        .delta
-                        .as_ref()
-                        .map_or_else(Vec::new, |d| d.chain.clone()),
-                },
-                account_id.clone(),
-            )),
-        })
+        let inner = ResponseStream::new(
+            Box::pin(stream),
+            guard,
+            SessionHandle {
+                client: account.client(),
+                token,
+                session_id,
+                message_id: stop_id,
+                sessions: self.active_sessions.clone(),
+                account: Some(account),
+                keep_on_finish: self.session_reuse,
+                chain: req
+                    .delta
+                    .as_ref()
+                    .map_or_else(Vec::new, |d| d.chain.clone()),
+            },
+            account_id.clone(),
+            self.auto_resume.thinking_heartbeat_secs,
+        );
+        let inner = self.maybe_supervise(inner, req, request_id);
+        let stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, CoreError>> + Send>> =
+            Box::pin(inner);
+        Ok(ChatResponse { stream })
     }
+}
+
+// ── 截断续写 ──────────────────────────────────────────────────────────
+
+/// 续写回调所需的共享状态：(账号池, 原始请求, request_id, 用空 prompt 续写)
+type SharedReplier = Arc<Mutex<Option<(Arc<Accounts>, ChatRequest, String, bool)>>>;
+
+/// 构造注入 `ResponseStream` 的续写回调
+///
+/// 回调在流的 EOF 分支里被 `poll`；它完成一次最小化的续写：取空闲账号 →
+/// 计算 PoW → 用同一 `chat_session_id` / `parent_message_id` 再发一次 completion，
+/// 只把前两个 SSE 事件之外的部分交回给流（新流从 ready 之后接着解析）。
+fn build_replier(shared: SharedReplier) -> super::resume::ResumeReplier {
+    Box::new(move |ticket: super::resume::ResumeTicket| {
+        let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((accounts, req, request_id, empty_prompt)) = state.take() else {
+            return Box::pin(async {
+                Err(CoreError::ProviderError("续写状态已释放".into()))
+            });
+        };
+        let model_type = req.model_type.clone();
+        let thinking_enabled = req.thinking_enabled;
+        let search_enabled = req.search_enabled;
+        // 一次性消费：续写失败后不再重试（上限由流侧计数控制）
+        drop(state);
+        Box::pin(async move {
+            resume_completion(
+                &accounts,
+                &request_id,
+                ticket,
+                empty_prompt,
+                model_type,
+                thinking_enabled,
+                search_enabled,
+            )
+            .await
+        })
+    })
+}
+
+/// 真正执行一次续写 completion
+async fn resume_completion(
+    accounts: &Accounts,
+    request_id: &str,
+    ticket: super::resume::ResumeTicket,
+    empty_prompt: bool,
+    model_type: String,
+    thinking_enabled: bool,
+    search_enabled: bool,
+) -> Result<super::resume::ResumedStream, CoreError> {
+    let guard = accounts
+        .get_account_with_wait(30_000)
+        .await
+        .ok_or(CoreError::Overloaded)?;
+    let account = guard.account_arc();
+    let pow_header = accounts
+        .compute_pow_for_target(&account, "/api/v0/chat/completion")
+        .await?;
+    let payload = CompletionPayload {
+        chat_session_id: ticket.session_id.clone(),
+        parent_message_id: Some(ticket.parent_message_id),
+        model_type,
+        prompt: super::resume::resume_prompt(empty_prompt),
+        ref_file_ids: Vec::new(),
+        thinking_enabled,
+        search_enabled,
+        action: None,
+        source: crate::accounts::COMPLETION_SOURCE_INPUT,
+        preempt: false,
+    };
+    let _ = (&ticket.prompt, &ticket.request_id);
+    log::info!(
+        target: "ds_core::accounts",
+        "req={request_id} 续写 completion: session_id={}, parent={}",
+        ticket.session_id,
+        ticket.parent_message_id
+    );
+    let mut raw = accounts.completion(&account, &pow_header, &payload).await?;
+
+    // 丢掉 ready + hint 两个事件（续写时下游已经收过 Meta），重新取 stop_id
+    let mut buf = Vec::new();
+    let mut text = String::new();
+    let (ready_block, second_block) = loop {
+        let chunk = raw
+            .next()
+            .await
+            .ok_or_else(|| CoreError::Stream("续写流为空".into()))?
+            .map_err(|e| CoreError::Stream(e.to_string()))?;
+        buf.extend_from_slice(&chunk);
+        text.push_str(&String::from_utf8_lossy(&chunk));
+        if let Some((a, b)) = split_two_events(&text) {
+            break (a.to_owned(), b.to_owned());
+        }
+    };
+    if let Some(err) = check_hint(&second_block) {
+        log::warn!(
+            target: "ds_core::accounts",
+            "req={request_id} 续写 hint 错误"
+        );
+        return Err(err);
+    }
+    let (_, message_id) = parse_ready_message_ids(ready_block.as_bytes());
+
+    // 上游 ready 之后可能还有同一批事件里剩余的字节：把 buf 里 ready 之外的部分
+    // 交给新流解析（直接复用整段 buf 也会被帧解析器忽略重复的 ready）。
+    let rest = Bytes::from(buf);
+    Ok(super::resume::ResumedStream {
+        raw: Box::pin(futures::stream::once(futures::future::ready(Ok(rest))).chain(raw)),
+        message_id,
+    })
 }
 
 // ── ChatML 解析与历史拆分 ──────────────────────────────────────────────

@@ -6,6 +6,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### 新增：单账号最小请求间隔（`request_min_interval_secs`）
+
+- 除每小时配额之外，新增**时间分布**维度的限速：`[ds_core] request_min_interval_secs`
+  （默认 `0` = 关闭）。开启后调度器会跳过尚未到间隔的账号，并按最早可用时刻精确等待；
+  实际等待为 `base ~ base × 1.4` 的随机值 —— 真实用户发消息稀疏且不规律，恒速一问一答
+  本身就是机器节奏。管理面板「请求配额」区块可直接修改。
+- **不再为缺省 `device_id` 的账号凭空派生一个全局共用的设备身份**。缺失时初始化直接告警，
+  要求如实填写「真实浏览器登录请求」里的 `device_id`：多个账号共用同一指纹会被上游聚成
+  同一台设备，提升禁言风险。`X-Device-Id` 与 `x-hif-leim` 令牌永远按账号派生。
+
+### 新增：登录请求加密（#118）
+
+- 上游 `POST /api/v0/users/login` 在 2026-10 起拒收明文 JSON（422）。按官方前端实现补齐：
+  `JSON.stringify(body)` → AES-128-CBC/PKCS#7（16B 随机 key + 16B IV）→ 用 `key‖iv`
+  经 RSA-OAEP-SHA256 包裹写入 `x-request-encryption-key`，body 改为裸密文并重算
+  `content-length`。加密范围限定白名单 POST（`/api/v0/users/` + 登录等动作）。
+- 同时补齐 guest PoW：登录前用 `{target_path}` 向 guest 端点申请挑战，求解后带上
+  `x-ds-challenge-response`；失败只降级为不带该头，不阻断登录。
+- 新开关 `[ds_core] login_encryption`（默认 `true`，与官方一致）；关闭即回到明文登录，
+  仅用于抓包调试。管理面板可切换。
+
+### 新增：长思考保护（#122）
+
+- 新增 `[ds_core.auto_resume]` 段：
+  - `thinking_heartbeat_secs`（默认 `0`）：上游长思考静默期每 N 秒下发一条 `: ping`
+    SSE 注释行保活，客户端会忽略，纯心跳不改变语义。
+  - `on_truncation`（默认 `false`）：检测到「已有思考内容但无正文，且上游状态不是
+    FINISHED，或 `event: close` 携带 `auto_resume=true`」时自动续写。
+  - `max_attempts`（默认 `2`）：单次请求最多续写轮数。
+  - `empty_prompt`（默认 `true`）：续写发空 prompt 让上游接着生成，`false` 则发 `"continue"`。
+- 续写复用同一 `chat_session_id`，并把 `parent_message_id` 指向被截断的响应；
+  会话只在最终失败时清理。续写由流层内部调度，对外仍是同一条 SSE 流。
+- **空 prompt 续写尚未用真实账号验证**，默认关闭；建议先用单账号 A/B 观察再开。
+
+### 修复：#125 `TEMPLATE_RESPONSE` 片段被丢弃 / 补丁重放
+
+- `response/fragments` 路径的 `SET` 操作现在按索引增量处理：已知片段只更新类型、不重放
+  内容；新片段单独触发 `content` 事件。`TEMPLATE_RESPONSE` 与 `RESPONSE` 同等对待为正文，
+  避免部分回答整段丢失。`APPEND` 接受单个对象（非数组），不再静默丢弃。
+- 未识别的补丁路径改为 `debug!` 日志（不再是 `_ => {}` 静默吞掉），便于定位协议漂移。
+
 ### ⚠️ 默认配置改为「对齐浏览器」（行为变更）
 
 > 原则：**我们并不知道上游依据哪些信号判定违规**，因此每一项都向真实客户端靠拢 ——

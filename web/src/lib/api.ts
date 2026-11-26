@@ -216,6 +216,12 @@ export interface DsCoreConfig {
   tool_call: ToolCallTagConfig;
   default_search_enabled: boolean;
   hourly_request_quota: number;
+  /** Minimum seconds between two requests on the same account (0 = unlimited) */
+  request_min_interval_secs: number;
+  /** Long-thinking protection: heartbeat + truncation auto-resume */
+  auto_resume: AutoResumeConfig;
+  /** Encrypt /api/v0/users/* POST bodies like the official client */
+  login_encryption: boolean;
   responses_store_capacity: number;
   responses_store_ttl_secs: number;
 }
@@ -232,6 +238,17 @@ export interface AdminConfigResponse {
 export interface ApiKeyEntry {
   key: string;
   description: string;
+}
+
+export interface AutoResumeConfig {
+  /** Heartbeat interval during pure thinking (0 = disabled) */
+  thinking_heartbeat_secs: number;
+  /** Auto-resume generation when upstream truncates a long thinking turn */
+  on_truncation: boolean;
+  /** Max resume rounds per request */
+  max_attempts: number;
+  /** Send an empty prompt on resume (else "continue") */
+  empty_prompt: boolean;
 }
 
 export interface FullConfig {
@@ -271,6 +288,12 @@ const DEFAULTS = {
   responsesStoreTtlSecs: 3600,
   defaultSearchEnabled: false,
   hourlyRequestQuota: 60,
+  requestMinIntervalSecs: 0,
+  thinkingHeartbeatSecs: 0,
+  autoResumeOnTruncation: false,
+  autoResumeMaxAttempts: 2,
+  autoResumeEmptyPrompt: true,
+  loginEncryption: true,
 } as const;
 
 /**
@@ -338,6 +361,26 @@ export function normalizeConfig(raw: any): FullConfig {
           ? core.default_search_enabled
           : DEFAULTS.defaultSearchEnabled,
       hourly_request_quota: core.hourly_request_quota ?? DEFAULTS.hourlyRequestQuota,
+      request_min_interval_secs:
+        core.request_min_interval_secs ?? DEFAULTS.requestMinIntervalSecs,
+      auto_resume: {
+        thinking_heartbeat_secs:
+          core.auto_resume?.thinking_heartbeat_secs ?? DEFAULTS.thinkingHeartbeatSecs,
+        on_truncation:
+          typeof core.auto_resume?.on_truncation === 'boolean'
+            ? core.auto_resume.on_truncation
+            : DEFAULTS.autoResumeOnTruncation,
+        max_attempts:
+          core.auto_resume?.max_attempts ?? DEFAULTS.autoResumeMaxAttempts,
+        empty_prompt:
+          typeof core.auto_resume?.empty_prompt === 'boolean'
+            ? core.auto_resume.empty_prompt
+            : DEFAULTS.autoResumeEmptyPrompt,
+      },
+      login_encryption:
+        typeof core.login_encryption === 'boolean'
+          ? core.login_encryption
+          : DEFAULTS.loginEncryption,
       responses_store_capacity:
         core.responses_store_capacity ?? DEFAULTS.responsesStoreCapacity,
       responses_store_ttl_secs:

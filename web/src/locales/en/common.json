@@ -193,7 +193,16 @@
     "sessionPolicy": "Session policy",
     "sessionPolicyDesc": "Defaults to reuse to match the official client (one session is kept and reused indefinitely); per_request = new session per request, deleted when the stream ends (the old behaviour). The reuse semantics are not yet verified with a real account.",
     "sessionIdleSecs": "Reused-session idle timeout (seconds, 0 = delete only on shutdown)",
-    "quotaLabel": "Requests / hour / account"
+    "quotaLabel": "Requests / hour / account",
+    "minInterval": "Per-account Minimum Request Interval",
+    "minIntervalDesc": "Minimum seconds between two requests on the same account (0 = unlimited). Upstream looks at timing as well as volume: real users send messages sparsely and irregularly, while a constant request/response cadence is an obvious machine signal. When enabled, each interval gets 0-40% random jitter. For multi-account pools, 60-300 is a reasonable range.",
+    "minIntervalLabel": "Seconds / request / account",
+    "heartbeatLabel": "Thinking heartbeat (seconds)",
+    "heartbeatDesc": "Emit an SSE comment during pure-thinking silence to keep the connection alive (0 = off).",
+    "autoResumeDesc": "Automatically continue generation when upstream truncates a long thinking turn.",
+    "autoResumeAttemptsLabel": "Max resume attempts",
+    "autoResumeAttemptsDesc": "How many resume rounds a single request may trigger.",
+    "loginEncryptionDesc": "Encrypt /api/v0/users/* POST bodies (login included) exactly like the official client."
   },
   "logs": {
     "title": "Logs",

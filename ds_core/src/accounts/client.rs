@@ -423,7 +423,7 @@ impl ClientIdentity {
         put("X-Client-Platform", &self.client_platform)?;
         put("X-Client-Locale", &self.client_locale)?;
         put("X-Client-Bundle-Id", &self.client_bundle_id)?;
-        put("X-Device-Id", &self.device_id)?;
+        put("X-Device-Id", self.device_id.trim())?;
         put("X-Device-Model", &self.device_model)?;
         put("X-Client-Timezone-Offset", &self.timezone_offset)?;
         // 默认头里的 accept-language 固定 en-US，与 client_locale（默认 zh_CN）不符
@@ -496,11 +496,20 @@ impl DsClient {
         if let Some(url) = proxy_url.and_then(|u| wreq::Proxy::all(u).ok()) {
             builder = builder.proxy(url);
         }
-        // 空 = 按 api_base 确定性派生，保证重启后设备身份不变
-        if identity.device_id.trim().is_empty() {
-            identity.device_id = derive_device_uuid(api_base.as_bytes());
-        } else {
-            identity.device_id = identity.device_id.trim().to_string();
+        // 设备身份必须由调用方显式提供：真实 Web 客户端的 device_id 是浏览器登录时
+        // 由数美 SDK 生成的，拿不到就登录不了（biz_code 11）。这里再「按 api_base 派生
+        // 一个」只是把同一个假身份发给所有账号 —— 假指纹本身就是风险信号，而且会让
+        // 多个账号在上游侧被聚成同一台设备。真正生效的是 per-account 派生
+        // （pool::account_x_device_id）或显式配置的 client_device_id；两者都没配时
+        // 这里退化成空占位，由账号初始化阶段给出告警。
+        identity.device_id = identity.device_id.trim().to_string();
+        if identity.device_id.is_empty() {
+            warn!(
+                target: "ds_core::client",
+                "未配置 client_device_id，且该客户端视图未绑定账号设备身份；\
+                 请在 config.toml / 管理面板为每个账号填写真实浏览器的 device_id，\
+                 否则登录将被上游以 RISK_DEVICE_DETECTED(biz_code=11) 拒绝"
+            );
         }
 
         let http = builder.build().expect("构建 HTTP 客户端失败");
@@ -629,19 +638,55 @@ impl DsClient {
         envelope.into_result()
     }
 
-    pub async fn login(&self, payload: &LoginPayload) -> Result<LoginData, ClientError> {
+    /// 登录
+    ///
+    /// 2026-10 起上游要求请求体加密：body = AES-128-CBC(PKCS#7) 密文，
+    /// 包裹 AES key/IV 的 RSA-OAEP-SHA256 结果放进 `x-request-encryption-key`。
+    /// 明文 JSON 会被 422 拒绝（issue #118）。加密后仍保留原有请求头集合。
+    pub async fn login(
+        &self,
+        payload: &LoginPayload,
+        encryption_enabled: bool,
+        pow_header: Option<&str>,
+    ) -> Result<LoginData, ClientError> {
         let mut h = self.client_headers()?;
         h.insert(
             wreq::header::REFERER,
             wreq::header::HeaderValue::from_static("https://chat.deepseek.com/sign_in"),
         );
-        let resp = self
+        if let Some(pow) = pow_header {
+            h.insert(
+                "x-ds-challenge-response",
+                wreq::header::HeaderValue::from_str(pow).map_err(|e| {
+                    ClientError::InvalidHeader(format!("x-ds-challenge-response: {e}"))
+                })?,
+            );
+        }
+
+        let plaintext = serde_json::to_vec(payload)?;
+        let request = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_USERS_LOGIN))
-            .headers(h)
-            .json(payload)
-            .send()
-            .await?;
+            .headers(h);
+
+        let request = if encryption_enabled {
+            let encrypted =
+                super::crypto::encrypt_body(&plaintext, super::crypto::PROD_PUBLIC_KEY_B64)
+                    .map_err(|e| ClientError::InvalidHeader(format!("login encryption: {e}")))?;
+            request
+                .header(
+                    "x-request-encryption-key",
+                    wreq::header::HeaderValue::from_str(&encrypted.key_header).map_err(|e| {
+                        ClientError::InvalidHeader(format!("x-request-encryption-key: {e}"))
+                    })?,
+                )
+                .header(wreq::header::CONTENT_TYPE, "application/json")
+                .body(encrypted.body)
+        } else {
+            request.json(payload)
+        };
+
+        let resp = request.send().await?;
 
         if is_waf_challenge(&resp) {
             print_waf_hint();
@@ -759,6 +804,29 @@ impl DsClient {
         let wrapper: ChallengeWrapper = Self::parse_envelope(resp).await?;
         let challenge = wrapper.challenge;
         Ok(challenge)
+    }
+
+    /// guest PoW challenge（登录前匿名获取，不带 Authorization）
+    ///
+    /// 真实 Web 客户端对白名单路径（含 `users/login`）先解一次 guest challenge，
+    /// 结果写入 `x-ds-challenge-response`。与 `create_pow_challenge` 走同一端点，
+    /// 只是缺少 Bearer token。
+    pub async fn create_guest_pow_challenge(
+        &self,
+        target_path: &str,
+    ) -> Result<ChallengeData, ClientError> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}{}",
+                self.api_base, ENDPOINT_CHAT_CREATE_POW_CHALLENGE
+            ))
+            .headers(self.client_headers()?)
+            .json(&serde_json::json!({ "target_path": target_path }))
+            .send()
+            .await?;
+        let wrapper: ChallengeWrapper = Self::parse_envelope(resp).await?;
+        Ok(wrapper.challenge)
     }
 
     pub async fn completion(
@@ -912,10 +980,10 @@ impl DsClient {
 
 /// 由种子字节确定性派生 UUID（RFC 4122 v4 格式）
 ///
-/// 用途：
-/// - **按账号派生 X-Device-Id**（`ds-free-api:x-device-id:{数美 device_id}`）：
-///   稳定且每账号唯一，对齐真实客户端「一个浏览器 profile 一个设备身份」；
-/// - 全局 `client_device_id` 未配置、且账号也没有 `device_id` 时的兜底。
+/// 用途：**按账号派生 X-Device-Id**（`ds-free-api:x-device-id:{数美 device_id}`）——
+/// 稳定且每账号唯一，对齐真实客户端「一个浏览器 profile 一个设备身份」。
+/// 注意：**不**用于「账号没配 device_id 时兜底造一个」——假指纹对上游是风险信号，
+/// 且会让多个账号被聚成同一台设备；缺失时宁可报错要求补齐。
 pub(crate) fn derive_device_uuid(seed: &[u8]) -> String {
     fn fnv1a(data: &[u8], offset: u64) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ offset;
@@ -1020,7 +1088,8 @@ mod tests {
 
     #[test]
     fn client_headers_match_real_client_shape() {
-        let c = test_client();
+        // 未绑定设备身份时不再兜底派生：先按真实用法绑定一个，再验证头形态
+        let c = test_client().scoped_to("11111111-2222-4333-8444-555555555555");
         let h = c.client_headers().expect("headers");
         for name in [
             "user-agent",
@@ -1037,8 +1106,9 @@ mod tests {
         assert_eq!(h["x-client-version"], "2.5.0");
         assert_eq!(h["x-device-model"], "");
         assert_eq!(h["x-client-timezone-offset"], "28800");
-        // X-Device-Id 必须是 UUID 形态（api_base 派生）
-        assert_eq!(h["x-device-id"].len(), 36);
+        // X-Device-Id 必须是调用方绑定的 UUID 形态（账号派生 / 显式配置），
+        // 未绑定时为空，绝不凭空派生共用身份
+        assert_eq!(h["x-device-id"], "11111111-2222-4333-8444-555555555555");
 
         // 业务 API 必须是**页面内 XHR** 形态，而不是地址栏导航：
         // 真实浏览器抓包为 accept: */*、sec-ch-ua-platform 与 UA 一致、

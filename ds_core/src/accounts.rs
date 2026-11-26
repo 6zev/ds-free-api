@@ -3,6 +3,7 @@
 //! chat 模块通过此门面访问账号相关能力。
 
 mod client;
+pub(crate) mod crypto;
 mod hif;
 pub(crate) mod pool;
 mod pow;
@@ -86,7 +87,9 @@ impl Accounts {
             }
         };
         let pool = AccountPool::new(config.hourly_request_quota, config.startup_health_check)
-            .with_session_reuse(session_reuse, config.session_idle_secs);
+            .with_session_reuse(session_reuse, config.session_idle_secs)
+            .with_request_min_interval(config.request_min_interval_secs)
+            .with_login_encryption(config.login_encryption);
         pool.init(account_creds, &client, &solver)
             .await
             .map_err(|e| match e {

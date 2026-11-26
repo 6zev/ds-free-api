@@ -25,6 +25,18 @@ pub(crate) mod types;
 pub use types::{ChatCompletionsRequest, ChatCompletionsResponse, ChatCompletionsResponseChunk};
 
 /// 流式响应类型（SSE 字节流）
+/// 根 crate 的 `[ds_core.auto_resume]` 段 → `ds_core::AutoResumeConfig`
+impl From<&crate::config::AutoResumeSection> for ds_core::AutoResumeConfig {
+    fn from(section: &crate::config::AutoResumeSection) -> Self {
+        Self {
+            thinking_heartbeat_secs: section.thinking_heartbeat_secs,
+            on_truncation: section.on_truncation,
+            max_attempts: section.max_attempts,
+            empty_prompt: section.empty_prompt,
+        }
+    }
+}
+
 pub type StreamResponse = Pin<Box<dyn Stream<Item = Result<Bytes, OpenAIAdapterError>> + Send>>;
 
 /// 流式响应结构体流
@@ -83,6 +95,9 @@ impl OpenAIAdapter {
             model_types: config.ds_core.model_types.clone(),
             input_character_limits: config.ds_core.input_character_limits.clone(),
             hourly_request_quota: config.ds_core.hourly_request_quota,
+            request_min_interval_secs: config.ds_core.request_min_interval_secs,
+            auto_resume: (&config.ds_core.auto_resume).into(),
+            login_encryption: config.ds_core.login_encryption,
         };
         let accounts: Vec<AccountConfig> = config
             .ds_core
@@ -194,6 +209,7 @@ impl OpenAIAdapter {
             model_type: model_res.model_type,
             files: file_result.files,
             delta,
+            ..Default::default()
         };
 
         let chat_resp = self.try_chat(chat_req, request_id).await?;
@@ -344,6 +360,7 @@ impl OpenAIAdapter {
             model_type: model_res.model_type,
             files: vec![],
             delta: None,
+            ..Default::default()
         };
         let chat_resp = self.try_chat(ds_req, request_id).await?;
         let (account_id, event_stream) = Self::take_meta(chat_resp.stream).await?;
@@ -547,6 +564,9 @@ impl OpenAIAdapter {
             model_types: new_config.ds_core.model_types.clone(),
             input_character_limits: new_config.ds_core.input_character_limits.clone(),
             hourly_request_quota: new_config.ds_core.hourly_request_quota,
+            request_min_interval_secs: new_config.ds_core.request_min_interval_secs,
+            auto_resume: (&new_config.ds_core.auto_resume).into(),
+            login_encryption: new_config.ds_core.login_encryption,
         };
         self.ds_core.reload_config(&core_cfg).await
     }
@@ -593,6 +613,7 @@ impl OpenAIAdapter {
                     model_type: "default".to_string(),
                     files: vec![],
                     delta: None,
+                    ..Default::default()
                 };
                 log::debug!(
                     target: "adapter",
