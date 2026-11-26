@@ -221,6 +221,7 @@ jobs:
         env:
           ZIG_ARCH: ${{ matrix.zig_arch }}
           ZIG_TARGET: ${{ matrix.zig_target }}
+          ZIG_TRIPLE_RUST: ${{ matrix.target }}
         run: |
           url="https://ziglang.org/download/0.13.0/zig-linux-${ZIG_ARCH}-0.13.0.tar.xz"
           curl -sSL "$url" | tar xJ -C /opt
