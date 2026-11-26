@@ -94,14 +94,28 @@ GitHub Actions（`.github/workflows/release.yml`）在 tag push 时自动执行�
 ```
 build-frontend (bun install --frozen-lockfile + bun run build)
   ├── build-linux-gnu (cargo build)     │
-  ├── build-linux-musl (musl-cross)     │── release (tar.gz + zip)
+  ├── build-linux-musl (native runner)  │── release (tar.gz + zip)
   ├── build-macos (cargo build)  │
   └── build-windows (cargo build)│
   └── docker (ghcr.io image)
 ```
 
-`build-frontend` 产出 `web-dist` artifact，各编译 job 下载后再执行 `cargo build` /
-`cross build`，保证 `rust_embed` 嵌入真实前端文件。
+`build-frontend` 产出 `web-dist` artifact，各编译 job 下载后再执行 `cargo build`，
+保证 `rust_embed` 嵌入真实前端文件。
+
+musl 产物不再用 `*-linux-musl-cross` 交叉工具链：`wreq → boring2 → boring-sys2` 是
+build-dependency，永远按 host 编译，交叉时 bindgen 解析不了 musl 头文件
+（`bits/libc-header-start.h` 缺失），v0.6.0 的 aarch64-musl 构建因此失败。现在改为
+**原生 runner**（x86_64 用 `ubuntu-latest`，aarch64 用 `ubuntu-24.04-arm`）+ zig 的
+musl C/C++ 驱动，host == target，bindgen 保持原生模式。
+
+zig 只负责**编译**：链接不能交给 `zig cc` —— zig 0.13 即使收到 `-nostdlib/-nostartfiles`
+也会强行注入自己的 musl `crt1.o/crti.o`，与 rustc 从 `self-contained` 传入的启动文件撞成
+`duplicate symbol: _start/_init/_fini`。因此 wrapper 把链接阶段改交给 **rustc 自带的 lld**
+（`gcc-ld/ld.lld`），并在传递前翻译 gcc 驱动层参数：丢弃 `-m64/-nostartfiles/-nodefaultlibs`、
+把 `-static-pie` 映射成 `-static -pie`（否则 `rcrt1.o` + 非 PIE 会段错误）、
+`-Wl,a,b → a b`，并丢弃 `-lstdc++`（BoringSSL 不引用任何 libc++/libstdc++ 符号，
+`boring-sys2` 只是无条件追加了它）。启动文件与 `libc.a` 全部由 rustc 指定。
 
 Docker 镜像自动推送到 `ghcr.io/niyueee/ds-free-api:latest`。
 

@@ -167,6 +167,18 @@ jobs:
           path: "*.tar.gz"
           if-no-files-found: error
 
+  # ── Linux musl（静态链接，scratch / Alpine 可直接运行）──────────────
+  #
+  # 为什么不用 `*-linux-musl-g++` 交叉工具链：
+  #   `wreq` → `boring2` → `boring-sys2` 是 build-dependency，永远按 **host** 编译，
+  #   bindgen 跑在 runner 的 glibc 上；交叉构建时 bindgen 必须解析目标 C 库头文件
+  #   （musl 的 stdint.h + bits/），而 musl.cc 工具链的 sysroot 对 clang 不友好
+  #   （找不到 libc-header-start.h），v0.6.0 的 aarch64-musl 就死在
+  #   `unable to generate bindings`，x86_64-musl 仅因 fail-fast 被取消。
+  #
+  # 改为原生 runner 构建：x86_64 用 ubuntu-latest，aarch64 用 ubuntu-24.04-arm，
+  # host == target，保持 bindgen 原生模式；C/C++ 侧用 zig 的 musl 驱动
+  # （`aarch64-linux-musl-gcc` 等价物），Rust 侧 `-C target-feature=+crt-static` 静态链接。
   build-linux-musl:
     needs: [build-frontend, test]
     strategy:
@@ -174,23 +186,15 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             suffix: linux-x86_64-musl
-            package: x86_64-linux-musl-cross
-            apt_packages: ""
-            custom_env:
-              CC: x86_64-linux-musl-gcc
-              CXX: x86_64-linux-musl-g++
-              CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-g++
-              RUSTC_LINKER: x86_64-linux-musl-g++
+            runner: ubuntu-latest
+            zig_target: x86_64-linux-musl
+            zig_arch: x86_64
           - target: aarch64-unknown-linux-musl
             suffix: linux-aarch64-musl
-            package: aarch64-linux-musl-cross
-            apt_packages: crossbuild-essential-arm64
-            custom_env:
-              CC: aarch64-linux-musl-gcc
-              CXX: aarch64-linux-musl-g++
-              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-g++
-              RUSTC_LINKER: aarch64-linux-musl-g++
-    runs-on: ubuntu-latest
+            runner: ubuntu-24.04-arm
+            zig_target: aarch64-linux-musl
+            zig_arch: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
       - name: Download frontend assets
@@ -211,23 +215,129 @@ jobs:
         with:
           target: ${{ matrix.target }}
           cache-key: ${{ matrix.target }}
-      - name: Install base dependencies
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake g++ libclang-dev perl pkg-config
+      - name: Install zig (musl C/C++ driver)
+        env:
+          ZIG_ARCH: ${{ matrix.zig_arch }}
+          ZIG_TARGET: ${{ matrix.zig_target }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake perl pkg-config libclang-dev musl-tools
-      - name: Install target-specific APT dependencies
-        if: ${{ matrix.apt_packages != '' }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.apt_packages }}
-      - name: Install musl cross-compiler
-        run: |
-          wget https://github.com/musl-cc/musl.cc/releases/latest/download/${{ matrix.package }}.tgz
-          tar xzf ${{ matrix.package }}.tgz -C /opt
-          echo "/opt/${{ matrix.package }}/bin/" >> "$GITHUB_PATH"
+          url="https://ziglang.org/download/0.13.0/zig-linux-${ZIG_ARCH}-0.13.0.tar.xz"
+          curl -sSL "$url" | tar xJ -C /opt
+          /opt/zig-linux-${ZIG_ARCH}-0.13.0/zig version
+          # cc-rs 会自动追加 `--target=<rust triple>`，zig 不认识 Rust 的 triple
+          # （`x86_64-unknown-linux-musl` → UnknownOperatingSystem）。wrapper 把
+          # `-target` 固定在前面，并丢掉调用方传入的重复 target 参数。
+          #
+          # 链接不能交给 zig cc：zig 0.13 即使收到 `-nostdlib/-nostartfiles` 也会
+          # 强行塞入自己的 musl crt1.o/crti.o，与 rustc 从 self-contained 传入的
+          # 启动文件撞成 `duplicate symbol: _start/_init/_fini`。因此：
+          #   编译/预处理 → zig cc（正确 target、正确头文件）
+          #   链接       → rustc 自带的 lld（GNU 风味），启动文件/libc.a 完全由
+          #               rustc 传入的 .o/.a 决定；gcc 驱动层专有参数在此翻译/剥除：
+          #        · -m64/-nostartfiles/-nodefaultlibs → 丢弃（lld 无对应概念）
+          #        · -static-pie  → `-static -pie`（否则 rcrt1.o + 非 PIE 会崩溃）
+          #        · -Wl,a,b      → `a b`
+          #        · -lstdc++     → 丢弃（BoringSSL 无任何 libc++/libstdc++ 引用，
+          #                          boring-sys 只是无条件追加了它）
+          RUST_LLD="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/gcc-ld/ld.lld"
+          test -x "$RUST_LLD"
+          echo "RUST_LLD=$RUST_LLD" >> "$GITHUB_ENV"
+          mkdir -p /opt/musl-cc
+          for mode in cc c++; do
+            wrapper="/opt/musl-cc/${ZIG_ARCH}-linux-musl-${mode}"
+            sed 's/^          //' > "$wrapper" <<'WRAP'
+          #!/bin/sh
+          set -e
+          # 丢弃调用方传入的 --target=… / -target <val>：cc-rs 会追加 Rust triple，
+          # zig 不认识它（UnknownOperatingSystem）。target 由本脚本固定。
+          compile_only="no"
+          clean=""
+          skip_next=""
+          for a in "$@"; do
+            if [ -n "$skip_next" ]; then skip_next=""; continue; fi
+            case "$a" in
+              --target=*) continue ;;
+              -target) skip_next=1; continue ;;
+              -c|-E|-S|-M|-MM|-fsyntax-only) compile_only="yes" ;;
+            esac
+            clean="$clean
+          $a"
+          done
+          if [ "$compile_only" = "yes" ]; then
+            exec __ZIG__ __MODE__ -target __TRIPLE__ $(printf '%s\n' "$clean" | tail -n +2)
+          fi
+          # ---- 链接：把 rustc 的 gcc 风格参数翻译成 lld 能吃的 ----
+          lld_args=""
+          need_val=""
+          for a in "$@"; do
+            if [ -n "$need_val" ]; then
+              need_val=""
+              case "$prev" in
+                -o) lld_args="$lld_args -o $a" ;;
+                -L) lld_args="$lld_args -L$a" ;;
+                -l) lld_args="$lld_args -l$a" ;;
+                -isystem|-I|-D|-U|-MF|-MT|-MQ) ;;
+              esac
+              continue
+            fi
+            case "$a" in
+              --target=*|-m64|-m32|-march=*|-mtune=*|-mcmodel=*) continue ;;
+              -nostartfiles|-nodefaultlibs|-nostdlib|-static-libgcc) continue ;;
+              -pthread|-shared|-rdynamic|-fsyntax-only|-c|-E|-S) continue ;;
+              -lstdc++|-lc++|-lc++abi|-lsupc++) continue ;;
+              -static-pie) lld_args="$lld_args -static -pie" ;;
+              -static) lld_args="$lld_args -static" ;;
+              -pie) lld_args="$lld_args -pie" ;;
+              -o|-L|-l|-isystem|-I|-D|-U|-MF|-MT|-MQ) prev="$a"; need_val=1; continue ;;
+              -Wl,*) lld_args="$lld_args $(printf '%s' "${a#-Wl,}" | tr ',' ' ')" ;;
+              -Wl*)  lld_args="$lld_args $(printf '%s' "${a#-Wl}" | tr ',' ' ')" ;;
+              *) lld_args="$lld_args $a" ;;
+            esac
+          done
+          # GNU 驱动按 -m elf_<arch> 选择目标格式
+          exec __LLD__ -m __EMU__ $lld_args
+          WRAP
+            sed -i "s#__ZIG__#/opt/zig-linux-${ZIG_ARCH}-0.13.0/zig#; s#__MODE__#${mode}#; s#__TRIPLE__#${ZIG_TARGET}#; s#__LLD__#$RUST_LLD#; s#__EMU__#elf_${ZIG_ARCH}#" "$wrapper"
+          done
+          printf '#!/bin/sh\nexec /opt/zig-linux-%s-0.13.0/zig ar "$@"\n' "${ZIG_ARCH}" > /opt/musl-cc/${ZIG_ARCH}-linux-musl-ar
+          chmod +x /opt/musl-cc/*
+          # `wreq` 的 build-dep `boring-sys2` 里 bindgen（host clang）需要目标 C 库头文件。
+          # rustup 的 musl `self-contained` 目录只有 .o/libc.a，没有 headers（1.95 已验证），
+          # 所以直接用 zig 自带的 musl 头文件树。它同时含 CC 编译所需的一切，绑定时
+          # 也不影响真正的 C 编译（那些仍走 wrapper → zig cc）。
+          ZIG_INC="/opt/zig-linux-${ZIG_ARCH}-0.13.0/lib/libc/include"
+          ARCH_INC="${ZIG_TARGET}"
+          test -f "$ZIG_INC/generic-musl/stddef.h"
+          test -f "$ZIG_INC/$ARCH_INC/bits/alltypes.h"
+          MUSL_INC="-isystem $ZIG_INC/generic-musl -isystem $ZIG_INC/$ARCH_INC"
+          echo "MUSL_INC=${MUSL_INC}" >> "$GITHUB_ENV"
+          {
+            echo "CFLAGS_x86_64_unknown_linux_musl=$MUSL_INC"
+            echo "CXXFLAGS_x86_64_unknown_linux_musl=$MUSL_INC"
+            echo "CFLAGS_aarch64_unknown_linux_musl=$MUSL_INC"
+            echo "CXXFLAGS_aarch64_unknown_linux_musl=$MUSL_INC"
+            # bindgen 会按 TARGET 查询 BINDGEN_EXTRA_CLANG_ARGS_<triple>，逐 target 写入
+            echo "BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_musl=$MUSL_INC"
+            echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_musl=$MUSL_INC"
+          } >> "$GITHUB_ENV"
+          echo "/opt/musl-cc" >> "$GITHUB_PATH"
+          cat /opt/musl-cc/${ZIG_ARCH}-linux-musl-cc
       - name: Build
-        env: ${{ matrix.custom_env }}
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: |
+          export CC_x86_64_unknown_linux_musl="${{ matrix.zig_arch }}-linux-musl-cc"
+          export CXX_x86_64_unknown_linux_musl="${{ matrix.zig_arch }}-linux-musl-c++"
+          export AR_x86_64_unknown_linux_musl="${{ matrix.zig_arch }}-linux-musl-ar"
+          export CC_aarch64_unknown_linux_musl="${{ matrix.zig_arch }}-linux-musl-cc"
+          export CXX_aarch64_unknown_linux_musl="${{ matrix.zig_arch }}-linux-musl-c++"
+          export AR_aarch64_unknown_linux_musl="${{ matrix.zig_arch }}-linux-musl-ar"
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="${{ matrix.zig_arch }}-linux-musl-cc"
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="${{ matrix.zig_arch }}-linux-musl-cc"
+          cargo build --release --locked --target ${{ matrix.target }}
+      - name: Verify static linkage
+        run: |
+          ldd "target/${{ matrix.target }}/release/ds-free-api" && exit 1 || true
+          "target/${{ matrix.target }}/release/ds-free-api" --version || true
       - name: Package
         run: |
           name="ds-free-api-${{ steps.meta.outputs.tag }}-${{ matrix.suffix }}"
