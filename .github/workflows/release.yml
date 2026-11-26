@@ -315,7 +315,7 @@ jobs:
           esac
           exec __LLD__ $lld_args
           WRAP
-            sed -i "s#__ZIG__#/opt/zig-linux-${ZIG_ARCH}-0.13.0/zig#; s#__MODE__#${mode}#; s#__TRIPLE__#${ZIG_TARGET}#; s#__LLD__#$RUST_LLD#; s#__SELFC__#$MUSL_SELFC#" "$wrapper"
+            sed -i "s#__ZIG__#/opt/zig-linux-${ZIG_ARCH}-0.13.0/zig#; s#__MODE__#${mode}#; s#__TRIPLE__#${ZIG_TARGET}#; s#__LLD__#$RUST_LLD#; s#__SELFC__#$MUSL_SELFC#g" "$wrapper"
           done
           printf '#!/bin/sh\nexec /opt/zig-linux-%s-0.13.0/zig ar "$@"\n' "${ZIG_ARCH}" > /opt/musl-cc/${ZIG_ARCH}-linux-musl-ar
           chmod +x /opt/musl-cc/*
