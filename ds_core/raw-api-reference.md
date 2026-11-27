@@ -475,7 +475,8 @@ case "APPEND":
 
 | 路径/字段 | 说明 |
 |-----------|------|
-| `response/fragments/-1/content` | 最后一个 fragment 的内容 |
+| `response/fragments/-1/content` | 最后一个 fragment 的内容（`APPEND` 时为**纯增量**） |
+| `response/fragments` | `SET` 时回放缓照；已存在的 RESPONSE 片段携带**累积全文** |
 | `response/fragments/-1/elapsed_secs` | 思考/搜索耗时（秒），仅 THINK 类型 |
 | `response/fragments/-1/status` | fragment 状态 `WIP` → `FINISHED` |
 | `response/fragments/-{n}/status` | 负索引标记任意 fragment 完成 |
@@ -538,6 +539,11 @@ type == "RESPONSE"  → 实际输出内容
 15. BATCH       → accumulated_token_usage + quasi_status="FINISHED"
 16. DONE        → status="FINISHED"
 ```
+
+> **注意（2026-11 实测）**：第 12 步的 `CONTENT` 并不总是纯增量 —— 上游会在正文流中途
+> 再次整体 `SET` `response/fragments`，其中的 RESPONSE 片段携带**累积全文**，并且数组
+> 可能比已知片段多出尾随占位项。解析器必须按已发字符数取差值尾部，并丢弃尾随项，
+> 否则会出现「客户端只收到开头几个字 / 正文重复回退」。见 v0.6.5。
 
 ### 流阶段顺序（thinking=OFF, search=OFF）
 

@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.5] - 2026-11-27
+
+### 修复：流式回答被截断（客户端只收到开头几个字，`finish_reason` 却是 `stop`）
+
+- **根因**：上游在正文流里会周期性用 `response/fragments` 的 `o:"SET"` 回放
+  **累积全文**。旧实现在处理已存在片段时直接 `continue`，快照里比已发出长度
+  更长的那一段被静默丢弃 —— 客户端拿到的是开头几个字，而 `FINISHED` 状态让适配层
+  照常上报 `finish_reason: "stop"`，表现为「回答莫名截断」。
+- **改动**：`PatchState` 记录当前 RESPONSE 片段的已发字符数
+  （`emitted_content_chars`）：
+  - `fragments` SET 里已存在片段的 `content` 视为**累积全文**，按已发长度取差值尾
+    部补发，不再整段跳过；
+  - `-1/content` 的 `o:"APPEND"` 是**纯增量**，原样拼接并累加长度；
+  - 新片段首片把长度归零后整段发出。
+- 回放快照若把数组补齐到比已知片段更多（`旧片段 + 当前片段 + 占位`），多出来的尾随
+  片段不再收进状态（`replay_tail_start`），否则随后的 `-1/content` 会落到假片段上、
+  把增量当新片重发（正文重复回退）。
+- 顺带把 `-1/content` 增量与 `fragments` 快照的语义分开记账，修掉了旧实现里
+  「首片 `SET` 之后的 APPEND 被当成全文回放」的隐性重复。
+- 新增回归：`fragments_set_beyond_emitted_emits_only_tail`、
+  `content_append_is_pure_delta`、
+  `fragments_set_growth_with_trailing_fragment_truncates_replay`、
+  `growth_snapshot_after_delta_emits_only_new_tail`（完整序列另外用
+  `scripts/risk-experiment/mock_upstream.py` 的 growth 形态做了端到端验证）。
+
 ## [0.6.4] - 2026-11-27
 
 ### 修复：所有鉴权业务请求补齐风控令牌（`x-hif-leim` / `x-hif-dliq`）

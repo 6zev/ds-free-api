@@ -178,6 +178,20 @@ struct PatchState {
     pending_fragment: bool,
     /// 最近一次 `event: close` 的 `auto_resume`：true = 上游建议继续生成
     auto_resume: bool,
+    /// 当前 RESPONSE 片段已发出的字符数。
+    ///
+    /// `-1/content` 是纯增量，直接拼接并累加；`fragments` SET 携带的是**累积全文**，
+    /// 按这个长度取差值尾部。旧实现直接把已存在片段整个跳过 —— 快照里比已发长度更长
+    /// 的那段就永久丢失，客户端只收到开头几个字、`finish_reason` 却是 `stop`，
+    /// 这正是线上遇到的截断。新片段开始时归零，等于「仍处于首片」，无需额外布尔标记。
+    emitted_content_chars: usize,
+    /// `fragments` SET 回放 **上一片** 响应正文后，内部数组被截断在这里。
+    ///
+    /// 上游在正文中途回放的是「已完成的旧片段 + 当前片段」的快照，不会重新追加新的
+    /// 正文片段。若照单全收，`fragments` 里会多出一条假片段，随后的 `-1/content`
+    /// 增量就落在它身上、被当成新片重发（线上表现为正文回退重复）。所以一旦 SET
+    /// 产出了正文尾部，就记下长度，把这一轮多出来的尾随片段丢掉。
+    replay_tail_start: Option<usize>,
 }
 
 impl PatchState {
@@ -190,6 +204,8 @@ impl PatchState {
         self.response_has_content = false;
         self.pending_fragment = false;
         self.auto_resume = false;
+        self.emitted_content_chars = 0;
+        self.replay_tail_start = None;
     }
 
     const fn new() -> Self {
@@ -202,7 +218,41 @@ impl PatchState {
             response_has_content: false,
             pending_fragment: false,
             auto_resume: false,
+            emitted_content_chars: 0,
+            replay_tail_start: None,
         }
+    }
+
+    /// 发一段 RESPONSE 全文（`SET` 快照或新片段首片）：只发超出已发长度的尾部。
+    ///
+    /// `emitted_content_chars == 0` 即首片，`skip(0)` 天然整段发出。
+    fn emit_content(&mut self, events: &mut Vec<StreamEvent>, content: &str) {
+        if content.is_empty() {
+            return;
+        }
+        let total = content.chars().count();
+        if total <= self.emitted_content_chars {
+            return;
+        }
+        let tail: String = content.chars().skip(self.emitted_content_chars).collect();
+        self.emitted_content_chars = total;
+        self.response_has_content = true;
+        events.push(StreamEvent::ContentDelta { content: tail });
+    }
+
+    /// 追加一段纯增量（`-1/content` APPEND）：原样拼接并累加长度。
+    ///
+    /// 累加这一步是必须的：`-1/content` 之后上游可能回放一次 `fragments` SET 全文，
+    /// 那时差值才对得上。
+    fn push_content_delta(&mut self, events: &mut Vec<StreamEvent>, content: &str) {
+        if content.is_empty() {
+            return;
+        }
+        self.emitted_content_chars += content.chars().count();
+        self.response_has_content = true;
+        events.push(StreamEvent::ContentDelta {
+            content: content.to_owned(),
+        });
     }
 
     /// 消费一帧 SSE 文本，返回零个或多个 StreamEvent
@@ -366,6 +416,9 @@ impl PatchState {
 
         if let Some(arr) = response.get_mut("fragments").and_then(|f| f.as_array_mut()) {
             self.fragments.clear();
+            // 初始快照里的正文就是「已发的全文」：首片标记与已发长度必须同步，
+            // 否则后续 `fragments` SET 回放快照时会把整段正文重复发一遍。
+            self.emitted_content_chars = 0;
             for frag in arr {
                 let Some(obj) = frag.as_object_mut() else {
                     continue;
@@ -377,16 +430,11 @@ impl PatchState {
                     .get_mut("content")
                     .and_then(take_string)
                     .unwrap_or_default();
-                let is_think = ty == FRAG_THINK;
-                let is_response = is_response_frag(&ty);
-                if is_response && !content.is_empty() {
-                    self.response_has_content = true;
-                }
                 if !content.is_empty() {
-                    if is_think {
+                    if ty == FRAG_THINK {
                         events.push(StreamEvent::ThinkDelta { content });
-                    } else if is_response {
-                        events.push(StreamEvent::ContentDelta { content });
+                    } else if is_response_frag(&ty) {
+                        self.emit_content(&mut events, &content);
                     }
                 }
                 self.fragments.push(Fragment { ty });
@@ -426,14 +474,18 @@ impl PatchState {
                 }
             }
             "response/fragments/-1/content" | "/response/fragments/-1/content" => {
+                // 回放快照留下的尾随假片段到此为止：真正的增量一定属于当前片段，
+                // 必须先把数组截回快照产出的位置，否则增量会落在假片段上被重发。
+                if let Some(n) = self.replay_tail_start.take() {
+                    self.fragments.truncate(n);
+                }
                 if let Some(s) = take_string(val)
                     && let Some(frag) = self.fragments.last()
                 {
                     match frag.ty.as_str() {
                         FRAG_THINK => events.push(StreamEvent::ThinkDelta { content: s }),
                         _ if is_response_frag(&frag.ty) => {
-                            self.response_has_content = true;
-                            events.push(StreamEvent::ContentDelta { content: s });
+                            self.push_content_delta(&mut events, &s);
                         }
                         _ => {}
                     }
@@ -447,7 +499,9 @@ impl PatchState {
             // 其初始 content，这样对「SET 是完整快照」与「SET 只带新增」两种形态都安全。
             "response/fragments" | "/response/fragments" if op == "SET" && val.is_array() => {
                 let known = self.fragments.len();
+                let mut replayed = false;
                 if let Some(arr) = val.as_array_mut() {
+                    let mut emitted_tail = false;
                     for (i, item) in arr.iter_mut().enumerate() {
                         let Some(obj) = item.as_object_mut() else {
                             continue;
@@ -456,24 +510,49 @@ impl PatchState {
                             continue;
                         };
                         if i < known {
+                            let is_response = is_response_frag(&ty);
                             self.fragments[i].ty = ty;
+                            // 快照里已存在的 RESPONSE 片段携带的是**累积全文**：
+                            // 与已发长度相比多出来的尾部必须补发，否则上游在正文
+                            // 中途回放快照时，那一段就永久丢失（客户端只看到开头几个字，
+                            // finish_reason 却是 stop）。旧实现这里直接 `continue`。
+                            if is_response {
+                                let content = obj
+                                    .get_mut("content")
+                                    .and_then(take_string)
+                                    .unwrap_or_default();
+                                let before_emitted = self.emitted_content_chars;
+                                self.emit_content(&mut events, &content);
+                                if self.emitted_content_chars != before_emitted {
+                                    emitted_tail = true;
+                                }
+                            }
                             continue;
+                        }
+                        // 回放快照只携带「旧片段 + 当前片段」，后面多出来的片段是上游把
+                        // 快照数组补齐的结果，不是新正文；收下会让下一条 `-1/content`
+                        // 落到假片段上导致重复输出。
+                        if emitted_tail {
+                            replayed = true;
+                            break;
                         }
                         let content = obj
                             .get_mut("content")
                             .and_then(take_string)
                             .unwrap_or_default();
-                        if !content.is_empty() {
-                            if ty == FRAG_THINK {
+                        if ty == FRAG_THINK {
+                            if !content.is_empty() {
                                 events.push(StreamEvent::ThinkDelta { content });
-                            } else if is_response_frag(&ty) {
-                                self.response_has_content = true;
-                                events.push(StreamEvent::ContentDelta { content });
                             }
+                        } else if is_response_frag(&ty) {
+                            // 新片段的首片：已发长度归零，整段发出
+                            self.emitted_content_chars = 0;
+                            self.emit_content(&mut events, &content);
                         }
                         self.fragments.push(Fragment { ty });
                     }
                 }
+                self.replay_tail_start = replayed.then_some(self.fragments.len());
             }
             "response/fragments" | "/response/fragments" if op == "APPEND" => {
                 // 某些版本 APPEND 单个 fragment 对象而非数组，统一包成数组处理
@@ -495,13 +574,14 @@ impl PatchState {
                             .unwrap_or_default();
                         let is_think = ty == FRAG_THINK;
                         let is_response = is_response_frag(&ty);
-                        if !content.is_empty() {
-                            if is_think {
+                        if is_think {
+                            if !content.is_empty() {
                                 events.push(StreamEvent::ThinkDelta { content });
-                            } else if is_response {
-                                self.response_has_content = true;
-                                events.push(StreamEvent::ContentDelta { content });
                             }
+                        } else if is_response {
+                            // 新追加的 RESPONSE 片段，`content` 是它的首片全文
+                            self.emitted_content_chars = 0;
+                            self.emit_content(&mut events, &content);
                         }
                         self.fragments.push(Fragment { ty });
                     }
@@ -1459,8 +1539,47 @@ mod tests {
             }
         }
         assert!(thinks.contains("We need answer"));
+        // `-1/content` 是纯增量：快照首片 "Hi" 之后追加 "!"，正文必须完整
         assert_eq!(content, "Hi!");
+        assert!(state.response_has_content);
         assert_eq!(state.status.as_deref(), Some("FINISHED"));
+        assert_eq!(classify_outcome(&state), StreamOutcome::Complete);
+    }
+
+    /// 回归：真实上游 2026-11 的思考流 —— 初始快照只有 THINK，正文片段靠
+    /// `fragments` SET 追加，`-1/content` 增量接在后面。这条序列与线上抓包逐帧一致，
+    /// 正文必须完整。若 SET 分支漏掉「已存在片段被新片段接替」的位置，
+    /// 后续 `-1/content` 会落到旧的 THINK 上，正文只剩首个分片。
+    #[test]
+    fn fragments_set_appends_response_after_think() {
+        let mut state = PatchState::new();
+        let frames = [
+            r#"data: {"v":{"response":{"status":"WIP","accumulated_token_usage":0,"fragments":[{"id":2,"type":"THINK","content":""}]}}}"#,
+            r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":"We"}"#,
+            r#"data: {"v":" need"}"#,
+            r#"data: {"v":" answer"}"#,
+            r#"data: {"p":"response/fragments/-1/elapsed_secs","o":"SET","v":0.37}"#,
+            r#"data: {"p":"response/fragments","v":[{"id":2,"type":"THINK","content":"We need answer","elapsed_secs":0.37}]}"#,
+            r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":" there"}"#,
+            r#"data: {"p":"response/fragments","v":[{"id":2,"type":"THINK","content":"We need answer there"},{"id":3,"type":"RESPONSE","content":"Hello My"}]}"#,
+            r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":" name deepseek"}"#,
+            r#"data: {"p":"response/fragments/-1/elapsed_secs","o":"SET","v":0.41}"#,
+            r#"data: {"p":"response/status","v":"FINISHED"}"#,
+        ];
+        let mut phase = Phase::Init;
+        let mut content = String::new();
+        for frame in frames {
+            let events = state.apply_frame(frame).expect("帧应可解析");
+            let mut out = VecDeque::new();
+            finalize_events(&mut state, &mut phase, events, &mut out);
+            for evt in out {
+                if let StreamEvent::ContentDelta { content: c } = evt {
+                    content.push_str(&c);
+                }
+            }
+        }
+        assert_eq!(content, "Hello My name deepseek");
+        assert!(state.response_has_content);
         assert_eq!(classify_outcome(&state), StreamOutcome::Complete);
     }
 
@@ -1608,6 +1727,71 @@ mod tests {
         assert!(state.response_has_content);
     }
 
+    /// 回归：唯一正文片段以外还有别的片段（如上游的思考/模板占位）时，
+    /// 已知片段被 SET 回放**增长后的全文**，多出来的片段不能收进数组。
+    ///
+    /// 线上截断正是这一段：`known = 2`、快照 3 条，第 3 条被 push 成假片段，
+    /// 下一条 `-1/content` 就落在假片段上重发；旧实现更糟 —— 已存在片段直接
+    /// `continue`，快照里长出来的尾部永远丢失。
+    #[test]
+    fn fragments_set_growth_with_trailing_fragment_truncates_replay() {
+        let mut state = PatchState::new();
+        // 1) THINK 片段在前
+        state.apply_frame(
+            r#"data: {"p":"response/fragments","o":"APPEND","v":[{"type":"THINK","content":"Think"}]}"#,
+        ).unwrap();
+        // 2) 正文片段首片（SET 新增）
+        state.apply_frame(
+            r#"data: {"p":"response/fragments","o":"SET","v":[{"type":"THINK"},{"type":"RESPONSE","content":"Hello My"}]}"#,
+        ).unwrap();
+        // 3) 纯增量补到 "Hello My name"
+        state
+            .apply_frame(r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":" name"}"#)
+            .unwrap();
+        assert_eq!(state.emitted_content_chars, 13);
+
+        // 4) 快照回放全文（22 字符）+ 一条尾随占位片段
+        let events = state.apply_frame(
+            r#"data: {"p":"response/fragments","o":"SET","v":[{"type":"THINK"},{"type":"RESPONSE","content":"Hello My name deepseek"},{"type":"RESPONSE","content":""}]}"#,
+        ).unwrap();
+        assert_eq!(content_text(&events), " deepseek");
+        assert_eq!(state.emitted_content_chars, 22);
+
+        // 5) 后续增量必须落在真正的正文片段上，且不重复已发内容
+        let events = state
+            .apply_frame(r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":"!"}"#)
+            .unwrap();
+        assert_eq!(content_text(&events), "!");
+        assert_eq!(state.fragments.len(), 2);
+    }
+
+    /// 回归：真实截断序列 —— 正文靠 `fragments` SET 快照长出来，
+    /// `-1/content` 只补纯增量，末尾再现一次全文快照。完整序列由 e2e 覆盖
+    /// （`scripts/risk-experiment/mock_upstream.py` 的 growth 形态）。
+    #[test]
+    fn growth_snapshot_after_delta_emits_only_new_tail() {
+        let mut state = PatchState::new();
+        let frames = [
+            r#"event: ready data: {"request_message_id":1,"response_message_id":2}"#,
+            r#"data: {"p":"response/status","o":"SET","v":"WIP"}"#,
+            r#"data: {"p":"response/fragments","o":"SET","v":[{"id":2,"type":"RESPONSE","content":"Hello My "}]}"#,
+            r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":"name deepseek"}"#,
+            r#"data: {"p":"response/fragments","o":"SET","v":[{"id":2,"type":"RESPONSE","content":"Hello My name deepseek"}]}"#,
+            r#"data: {"p":"response/status","o":"SET","v":"FINISHED"}"#,
+            "event: close data: {}",
+        ];
+        let mut content = String::new();
+        for frame in frames {
+            for evt in state.apply_frame(frame).expect("帧应可解析") {
+                if let StreamEvent::ContentDelta { content: c } = evt {
+                    content.push_str(&c);
+                }
+            }
+        }
+        assert_eq!(content, "Hello My name deepseek");
+        assert_eq!(classify_outcome(&state), StreamOutcome::Complete);
+    }
+
     /// 已知片段在 SET 快照里再次出现时只更新类型、不重复产出内容
     #[test]
     fn fragments_set_does_not_replay_known_content() {
@@ -1644,6 +1828,50 @@ mod tests {
         ).unwrap();
         assert_eq!(content_text(&events), "x");
         assert_eq!(state.fragments.len(), 1);
+    }
+
+    /// 回归：SET 快照携带**增长后**的全文时，只能发超出已发长度的尾部。
+    ///
+    /// 上游在正文流里会周期性回放 `response/fragments` SET，其中已存在 RESPONSE
+    /// 片段的 `content` 是「到当前为止的全文」。旧实现直接跳过已存在片段，
+    /// 于是快照里比已发长度更长的那一段被静默丢弃 → 客户端只收到开头几个字，
+    /// finish_reason 却是 `stop`。
+    #[test]
+    fn fragments_set_beyond_emitted_emits_only_tail() {
+        let mut state = PatchState::new();
+        // 首片走 APPEND（真实序列里大概率是 `-1/content`），已发 "Hello My" = 8 字符
+        state.apply_frame(
+            r#"data: {"p":"response/fragments","o":"APPEND","v":[{"type":"RESPONSE","content":"Hello My"}]}"#,
+        ).unwrap();
+        state
+            .apply_frame(r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":" name"}"#)
+            .unwrap();
+        assert_eq!(state.emitted_content_chars, 13);
+
+        // 快照把全文回放成 "Hello My name deepseek"（22 字符），只应补 " deepseek"
+        let events = state.apply_frame(
+            r#"data: {"p":"response/fragments","o":"SET","v":[{"type":"RESPONSE","content":"Hello My name deepseek"}]}"#,
+        ).unwrap();
+        assert_eq!(content_text(&events), " deepseek");
+        assert_eq!(state.emitted_content_chars, 22);
+    }
+
+    /// `-1/content` 是**纯增量**（上游从不回放全文），必须原样拼接。
+    #[test]
+    fn content_append_is_pure_delta() {
+        let mut state = PatchState::new();
+        state
+            .apply_frame(
+                r#"data: {"p":"response/fragments","o":"SET","v":[{"type":"RESPONSE","content":"Hello My"}]}"#,
+            )
+            .unwrap();
+        let events = state
+            .apply_frame(
+                r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":" name deepseek"}"#,
+            )
+            .unwrap();
+        assert_eq!(content_text(&events), " name deepseek");
+        assert_eq!(state.emitted_content_chars, 22);
     }
 
     /// 回归：续写 future 返回 `Pending` 后必须**被保存并继续 poll**。
