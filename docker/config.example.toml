@@ -135,6 +135,10 @@ port = 22217
 # [proxy]
 # url = "http://127.0.0.1:7890"
 # url = "socks5://127.0.0.1:7891"
+#
+# bypass_hosts：不走代理的主机名后缀（本地 mock 上游 / 自建中转）。
+# SOCKS5 按域名转发时由代理端解析，本地 hosts 不生效，必须在这里显式跳过。
+# bypass_hosts = ["localhost", "mock.lan"]
 
 # 支持的模型类型列表。
 #

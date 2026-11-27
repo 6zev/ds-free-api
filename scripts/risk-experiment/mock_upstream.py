@@ -12,6 +12,7 @@ PoW 说明（2026-10-07 实测）：`challenge` 与 `salt`/`expire_at` 之间存
 （`ds_core/raw-api-reference.md` §3），wasm 不校验 `expire_at` 是否过期。
 """
 import json
+import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -63,6 +64,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _sse_body(self, text="好的"):
         rid = RESPONSE_MSG_ID["n"] = RESPONSE_MSG_ID["n"] + 1
+        # `MOCK_THINK_ONLY=1`：复现上游「THINK-only 短流」（3 帧后直接 EOF）。
+        # 这是「零正文截断」的回归样本：客户端必须拿到 length / max_tokens /
+        # incomplete，而不是 stop / end_turn / completed。
+        if os.environ.get("MOCK_THINK_ONLY") == "1":
+            frames = [
+                "event: ready\ndata: "
+                + json.dumps({"request_message_id": rid - 1, "response_message_id": rid})
+                + "\n\n",
+                'event: update_session\ndata: {"p":"response/status","o":"SET","v":"WIP"}\n\n',
+                'data: {"p":"response/fragments","o":"APPEND","v":[{"type":"THINK","content":"We"}]}\n\n',
+            ]
+            return rid, "".join(frames).encode()
         frames = [
             "event: ready\ndata: "
             + json.dumps({"request_message_id": rid - 1, "response_message_id": rid})
@@ -105,8 +118,10 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         try:
             body = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            body = {"_raw": raw.decode("utf-8", "replace")}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # 上游 2026-10 起 login body 是 AES-128-CBC 密文；mock 不解密，
+            # 只要拿得到请求就当作合法登录（`_raw` 仅用于调试）。
+            body = {"_raw": raw.hex()[:64]}
 
         if path.endswith("/users/login"):
             return self._json(
@@ -171,4 +186,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    host = os.environ.get("MOCK_HOST", "127.0.0.1")
+    ThreadingHTTPServer((host, PORT), Handler).serve_forever()

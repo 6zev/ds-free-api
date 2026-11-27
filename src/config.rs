@@ -233,6 +233,12 @@ pub struct Account {
 pub struct ProxyConfig {
     /// 代理 URL，如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7891
     pub url: Option<String>,
+    /// 直连（不走代理）的主机名后缀列表，如 `["localhost", "mock.lan"]`。
+    ///
+    /// 用于本地 mock 上游 / 自建中转：SOCKS5 代理按域名转发时由代理端解析，
+    /// 本地 `hosts` 不生效，所以必须在这里显式跳过。
+    #[serde(default)]
+    pub bypass_hosts: Vec<String>,
 }
 
 /// 工具调用标签配置

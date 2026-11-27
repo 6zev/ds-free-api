@@ -215,16 +215,17 @@ pub fn from_chat_completions(resp: &ChatCompletionsResponse, ctx: &ResponseCtx) 
 /// 由 finish_reason 推导响应的 `status`
 fn resolve_status(finish_reason: Option<&str>) -> (&'static str, Option<IncompleteDetails>) {
     match finish_reason {
-        Some("length") => (
-            "incomplete",
-            Some(IncompleteDetails {
-                reason: "max_output_tokens",
-            }),
-        ),
         Some("content_filter") => (
             "incomplete",
             Some(IncompleteDetails {
                 reason: "content_filter",
+            }),
+        ),
+        // 缺省原因 = `ds_core` 判定「零 RESPONSE 分片」的截断，不能算 `completed`
+        Some("length") | None => (
+            "incomplete",
+            Some(IncompleteDetails {
+                reason: "max_output_tokens",
             }),
         ),
         _ => ("completed", None),
@@ -1272,7 +1273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eof_without_finish_reason_still_completes() {
+    async fn eof_without_finish_reason_is_incomplete() {
         let events = collect_events(vec![
             chunk(
                 Delta {
@@ -1297,7 +1298,12 @@ mod tests {
             "__done__",
             "stream must terminate with [DONE]"
         );
-        assert!(events.iter().any(|e| e["type"] == "response.completed"));
+        // 缺省结束原因 = 截断：必须报 incomplete，不能让客户端以为说完了
+        assert!(
+            events.iter().any(|e| e["type"] == "response.incomplete"),
+            "missing finish_reason must map to response.incomplete"
+        );
+        assert!(!events.iter().any(|e| e["type"] == "response.completed"));
     }
 
     #[tokio::test]

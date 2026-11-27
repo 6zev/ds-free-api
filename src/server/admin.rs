@@ -125,6 +125,7 @@ pub struct ToolCallTagConfigView {
 #[derive(Serialize)]
 pub struct ProxyConfigView {
     pub url: Option<String>,
+    pub bypass_hosts: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -204,6 +205,7 @@ fn mask_config(config: &Config) -> AdminConfigResponse {
         },
         proxy: ProxyConfigView {
             url: config.proxy.url.clone(),
+            bypass_hosts: config.proxy.bypass_hosts.clone(),
         },
         admin: AdminConfigView {
             password_set: !config.admin.password_hash.is_empty(),

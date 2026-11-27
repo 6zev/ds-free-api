@@ -43,6 +43,8 @@ pub struct DsCoreConfig {
     /// 复用模式下会话的空闲回收秒数（0 = 只在进程退出时删除）
     pub session_idle_secs: u64,
     pub proxy_url: Option<String>,
+    /// 不走代理的主机名后缀（本地 mock / 自建中转）
+    pub proxy_bypass_hosts: Vec<String>,
     pub model_types: Vec<String>,
     pub input_character_limits: Vec<u32>,
     /// 每账号每小时请求上限（0 = 不限制）

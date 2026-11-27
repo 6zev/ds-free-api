@@ -38,6 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         ds_core::EmulationProfile::from_config(&config.ds_core.emulation).unwrap_or_default(),
         config.proxy.url.as_deref(),
+        &config.proxy.bypass_hosts,
     );
 
     for account in &config.ds_core.accounts {

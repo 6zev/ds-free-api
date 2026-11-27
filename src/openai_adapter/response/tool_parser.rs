@@ -681,6 +681,12 @@ where
                                     }
                                     return Poll::Ready(Some(Ok(chunk)));
                                 }
+                                // 收集阶段拿到的 XML 一直没闭合就断流：不能把内容丢掉，
+                                // 当作普通正文发出去（客户端至少能看到模型写了什么）。
+                                choice.delta.content = Some(std::mem::take(buf));
+                                *this.state = ToolParseState::Detecting {
+                                    buffer: String::new(),
+                                };
                                 continue;
                             }
 
@@ -702,7 +708,19 @@ where
                                 if !buffer.is_empty() {
                                     choice.delta.content = Some(std::mem::take(buffer));
                                 }
-                                return Poll::Ready(Some(Ok(chunk)));
+                                // 带 tool_calls 的收尾才是 `tool_calls`；纯文本的收尾
+                                // （`stop` / 截断的 `length`）必须原样放行，否则「被截断」
+                                // 又会被改写成 `tool_calls`。
+                                if choice
+                                    .delta
+                                    .tool_calls
+                                    .as_ref()
+                                    .is_some_and(|calls| !calls.is_empty())
+                                    && choice.finish_reason == Some("stop")
+                                {
+                                    choice.finish_reason = Some("tool_calls");
+                                }
+                                *this.finish_emitted = true;
                             }
                             return Poll::Ready(Some(Ok(chunk)));
                         }
@@ -722,12 +740,16 @@ where
                                         OpenAIAdapterError::ToolCallRepairNeeded(flushed),
                                     )));
                                 }
+                                *this.finish_emitted = true;
                                 *this.state = ToolParseState::Done;
                                 return Poll::Ready(Some(Ok(chunk)));
                             }
                             return Poll::Ready(Some(Ok(chunk)));
                         }
                         ToolParseState::Done => {
+                            // 走到这里说明收尾 chunk 已经发过（状态机只在解析出
+                            // tool_calls 后进入 Done），绝不能再补一个 `tool_calls`：
+                            // 那会把截断文本伪装成工具调用。
                             if !*this.finish_emitted {
                                 *this.finish_emitted = true;
                                 let mut end =

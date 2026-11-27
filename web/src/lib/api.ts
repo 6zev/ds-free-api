@@ -228,6 +228,7 @@ export interface DsCoreConfig {
 
 export interface ProxyConfig {
   url: string | null;
+  bypass_hosts: string[];
 }
 
 export interface AdminConfigResponse {
@@ -388,6 +389,7 @@ export function normalizeConfig(raw: any): FullConfig {
     },
     proxy: {
       url: raw.proxy?.url ?? null,
+      bypass_hosts: raw.proxy?.bypass_hosts ?? [],
     },
     admin: {
       password_set: raw.admin?.password_set ?? true,

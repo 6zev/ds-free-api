@@ -238,10 +238,8 @@ impl Chat {
         req: &ChatRequest,
         request_id: &str,
     ) -> ResponseStream {
-        if !self.auto_resume.on_truncation
-            || self.auto_resume.max_attempts == 0
-            || req.resume.is_some()
-        {
+        let auto_resume = self.auto_resume.read().expect("auto_resume 锁中毒").clone();
+        if !auto_resume.on_truncation || auto_resume.max_attempts == 0 || req.resume.is_some() {
             return inner;
         }
         // replier 需要持有状态（账号池 + 原请求），用 Arc<Mutex> 共享给闭包
@@ -249,14 +247,10 @@ impl Chat {
             self.accounts.clone(),
             req.clone(),
             request_id.to_string(),
-            self.auto_resume.empty_prompt,
+            auto_resume.empty_prompt,
         ))));
         let replier = build_replier(shared);
-        inner.install_resume(
-            replier,
-            self.auto_resume.max_attempts,
-            self.auto_resume.empty_prompt,
-        );
+        inner.install_resume(replier, auto_resume.max_attempts, auto_resume.empty_prompt);
         inner
     }
 
@@ -381,7 +375,7 @@ impl Chat {
                 thinking_enabled: false,
                 search_enabled: false,
                 action: None,
-                source: crate::accounts::COMPLETION_SOURCE_INPUT,
+                source: crate::accounts::COMPLETION_SOURCE_DEFAULT,
                 preempt: false,
             };
 
@@ -454,7 +448,7 @@ impl Chat {
             thinking_enabled: req.thinking_enabled,
             search_enabled: req.search_enabled,
             action: None,
-            source: crate::accounts::COMPLETION_SOURCE_INPUT,
+            source: crate::accounts::COMPLETION_SOURCE_DEFAULT,
             preempt: false,
         };
 
@@ -603,7 +597,10 @@ impl Chat {
                 chain: Vec::new(),
             },
             account_id.clone(),
-            self.auto_resume.thinking_heartbeat_secs,
+            self.auto_resume
+                .read()
+                .expect("auto_resume 锁中毒")
+                .thinking_heartbeat_secs,
         );
         let inner = self.maybe_supervise(inner, req, request_id);
         let stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, CoreError>> + Send>> =
@@ -761,7 +758,7 @@ impl Chat {
             thinking_enabled: req.thinking_enabled,
             search_enabled: req.search_enabled,
             action: None,
-            source: crate::accounts::COMPLETION_SOURCE_INPUT,
+            source: crate::accounts::COMPLETION_SOURCE_DEFAULT,
             preempt: false,
         };
 
@@ -910,7 +907,10 @@ impl Chat {
                     .map_or_else(Vec::new, |d| d.chain.clone()),
             },
             account_id.clone(),
-            self.auto_resume.thinking_heartbeat_secs,
+            self.auto_resume
+                .read()
+                .expect("auto_resume 锁中毒")
+                .thinking_heartbeat_secs,
         );
         let inner = self.maybe_supervise(inner, req, request_id);
         let stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, CoreError>> + Send>> =
@@ -984,7 +984,7 @@ async fn resume_completion(
         thinking_enabled,
         search_enabled,
         action: None,
-        source: crate::accounts::COMPLETION_SOURCE_INPUT,
+        source: crate::accounts::COMPLETION_SOURCE_DEFAULT,
         preempt: false,
     };
     let _ = (&ticket.prompt, &ticket.request_id);

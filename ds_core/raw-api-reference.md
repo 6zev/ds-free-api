@@ -243,9 +243,11 @@ maxBackoffMs = 1000 * getFrozenFeature("hif_max_retry_interval_secs", 600);
   thinking_enabled, search_enabled, source, action, preempt }
 ```
 
-- **`source`**：*用户如何发出这条消息* —— `input`（输入框回车）/ `click`（发送按钮）/
-  `keyboard` / `paste` / `drag` / `file_picker` / `search` / `landing` / `api` 等。
-  代理侧统一填 `input`（真实用户最常态的路径）。
+- **`source`**：*消息来源枚举*。2026-10 前端 bundle 里看到过
+  `input` / `click` / `keyboard` / `paste` / `drag` / `file_picker` / `search` / `landing` / `api`
+  等取值，但 **2026-11-26 实测上游只接受 `default` / `landing`** —— 发 `input` 会得到
+  `HTTP 422: unknown variant \`input\`, expected \`default\` or \`landing\``。
+  代理侧统一填 `default`。
 - **`prompt`**：**只包含最新一条用户消息的文本**。历史不在 prompt 里 ——
   它保存在服务端会话中，靠 `parent_message_id` 串联（前端 bundle 中**没有任何**
   `<｜Role｜>` 之类标签字面量）。本代理在 `session_policy = reuse` 且纯对话形态下也已
@@ -364,11 +366,13 @@ maxBackoffMs = 1000 * getFrozenFeature("hif_max_retry_interval_secs", 600);
   "thinking_enabled": true,
   "search_enabled": true,
   "action": null,
+  "source": "default",
   "preempt": false
 }
 ```
 
 - `model_type`: `"expert"`（默认）| `"default"` | 等
+- `source`: `"default"` | `"landing"`（其它取值 → HTTP 422，见 0.5 节）
 - `ref_file_ids`: 上传文件后返回的文件 ID 数组，会话级别记忆，后续 `edit_message` 无需重复传入
 - `action`: 2026-10 抓包中真实客户端固定发 `null`（会话内首次消息）
 - `preempt`: 预占模式（目前网页端未使用），默认 false

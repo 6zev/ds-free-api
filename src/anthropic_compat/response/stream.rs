@@ -318,13 +318,15 @@ where
                 }
                 Poll::Ready(None) => {
                     debug!(target: "anthropic_compat::response::stream", "stream ended, started={}, finished={}", this.state.started, this.state.finished);
-                    // 流结束但未收到 finish_reason：优雅关闭
+                    // 流结束但未收到 finish_reason：`ds_core` 只在「零 RESPONSE 分片」时
+                    // 省略结束原因（截断），所以这里必须报 `max_tokens` 而不是 `end_turn`，
+                    // 否则客户端会把半句思考当成完整回答。
                     if !this.state.finished && this.state.started {
                         this.state.finished = true;
                         let mut events: Vec<MessagesResponseChunk> =
                             this.state.transition_to(BlockKind::None);
                         events.push(MessagesResponseChunk::MessageDelta {
-                            stop_reason: None,
+                            stop_reason: Some("max_tokens".to_string()),
                             stop_sequence: None,
                             output_tokens: Some(this.state.completion_tokens.unwrap_or(0)),
                         });
@@ -818,9 +820,9 @@ mod tests {
         // should have message_delta before message_stop
         let delta_idx = events.len() - 2;
         assert_eq!(events[delta_idx].event_name(), "message_delta");
-        // stop_reason should be None for graceful shutdown
+        // 缺省结束原因按截断处理：报 max_tokens，不能报 end_turn
         if let MessagesResponseChunk::MessageDelta { stop_reason, .. } = &events[delta_idx] {
-            assert_eq!(stop_reason, &None);
+            assert_eq!(stop_reason.as_deref(), Some("max_tokens"));
         }
     }
 

@@ -161,7 +161,9 @@
     },
     "proxy": {
       "url": "代理 URL（留空禁用）",
-      "placeholder": "http://127.0.0.1:7890"
+      "placeholder": "http://127.0.0.1:7890",
+      "bypassHosts": "不走代理的主机（逗号分隔）",
+      "bypassPlaceholder": "localhost, .lan"
     }
   },
   "settings": {

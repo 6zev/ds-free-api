@@ -384,6 +384,26 @@ export function SettingsPage() {
               className="font-mono text-xs"
             />
           </div>
+          <div className="mt-3">
+            <label htmlFor="set-prx-bypass" className="text-xs font-medium text-muted-foreground block mb-1.5">
+              {t('config.proxy.bypassHosts')}
+            </label>
+            <Input
+              id="set-prx-bypass"
+              value={(config.proxy?.bypass_hosts || []).join(', ')}
+              placeholder={t('config.proxy.bypassPlaceholder')}
+              onChange={(e) =>
+                update(
+                  ['proxy', 'bypass_hosts'],
+                  e.target.value
+                    .split(',')
+                    .map((h) => h.trim())
+                    .filter(Boolean),
+                )
+              }
+              className="font-mono text-xs"
+            />
+          </div>
         </CardContent>
       </Card>
 

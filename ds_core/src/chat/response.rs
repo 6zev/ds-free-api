@@ -158,8 +158,10 @@ struct Fragment {
 /// - `p` / `o` 跨事件持久化
 /// - `o` 默认 "SET"
 struct PatchState {
-    current_path: Option<String>,
-    current_op: Option<String>,
+    /// 粘滞的 `p`：只在当前帧内有效，裸增量帧用完即清
+    sticky_path: Option<String>,
+    /// 粘滞的 `o`：与 `sticky_path` 同生命周期
+    sticky_op: Option<String>,
     fragments: Vec<Fragment>,
     status: Option<String>,
     accumulated_token_usage: Option<u32>,
@@ -173,8 +175,8 @@ struct PatchState {
 
 impl PatchState {
     fn reset_for_resume(&mut self) {
-        self.current_path = None;
-        self.current_op = None;
+        self.sticky_path = None;
+        self.sticky_op = None;
         self.fragments = Vec::new();
         self.status = None;
         self.accumulated_token_usage = None;
@@ -185,8 +187,8 @@ impl PatchState {
 
     const fn new() -> Self {
         Self {
-            current_path: None,
-            current_op: None,
+            sticky_path: None,
+            sticky_op: None,
             fragments: Vec::new(),
             status: None,
             accumulated_token_usage: None,
@@ -257,23 +259,36 @@ impl PatchState {
     /// `val` 按值传入并原地取用：JSON 里的增量字符串直接**移出**交给下游事件，
     /// 避免「解析出一份 + 再拷贝一份」的双份分配。
     fn apply_patch(&mut self, mut val: serde_json::Value) -> Vec<StreamEvent> {
-        // p/o 跨事件持久化
+        // p/o 跨事件持久化（本帧显式给出的覆盖粘滞值）
         if let Some(p) = val.get("p").and_then(|v| v.as_str()) {
-            self.current_path = Some(p.to_string());
+            self.sticky_path = Some(p.to_string());
         }
         if let Some(o) = val.get("o").and_then(|v| v.as_str()) {
-            self.current_op = Some(o.to_string());
+            self.sticky_op = Some(o.to_string());
         }
-
-        let op = self.current_op.as_deref().unwrap_or("SET").to_string();
-        let path = self.current_path.as_deref().unwrap_or("").to_string();
 
         let Some(v) = val.get_mut("v") else {
             return Vec::new();
         };
 
+        // 无 path 的裸增量：上游在 `fragments/-1/content` 之后会连续下发
+        // `{"v":" xxx"}`（省略 p/o，沿用上一条的路径继续追加）。这一帧解析完
+        // 就必须清掉粘滞的 p/o，否则下一个只带 `p` 的帧（例如
+        // `{"p":"response/status","v":"FINISHED"}`）会继承 `APPEND`，被
+        // `apply_path` 的 SET 分支全部漏掉 —— 状态永远停在 WIP，流只能靠 EOF
+        // 判成截断，正文随之丢失（2026-11-26 空回复）。
+        let path = self.sticky_path.take().unwrap_or_default();
+        let op = match self.sticky_op.take() {
+            Some(o) => o,
+            // 裸数组沿用 fragments 的追加语义（`{"v":[…fragment…]}` 形态）
+            None if !v.is_object() && v.is_array() && path.ends_with("fragments") => {
+                String::from("APPEND")
+            }
+            None => String::from("SET"),
+        };
+
         // 初始快照：无 path 且 v 含 response
-        if self.current_path.is_none()
+        if path.is_empty()
             && let Some(response) = v.get_mut("response")
         {
             return self.apply_initial_snapshot(response);
@@ -537,7 +552,7 @@ fn frame_str(frame: &[u8]) -> Cow<'_, str> {
 
 // ── 响应阶段跟踪 ─────────────────────────────────────────────────────
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum Phase {
     Init,
     Thinking,
@@ -615,7 +630,10 @@ impl ResponseStream {
             resumed_any: false,
             resume_incomplete: false,
             heartbeat,
-            outcome: StreamOutcome::Complete,
+            // 尚未结束：初始值必须是 Truncated。用 Complete 作初始值会让
+            // 「WIP 之后直接断流」在 `classify_outcome` 之前就被当成正常结束
+            // （settle_on_finish 只降级 Complete，无法从 Complete 反映空正文）。
+            outcome: StreamOutcome::Truncated,
             replier: None,
             resume_fut: None,
             resume_attempts: 0,
@@ -629,6 +647,25 @@ impl ResponseStream {
         self.replier = Some(replier);
         self.resume_cap = cap;
         self.auto_resume_empty_prompt = empty_prompt;
+    }
+}
+
+/// 正常结束时按「本轮是否真的产出正文」判定结果
+///
+/// 上游对空回复（例如判为重复提问）照样下发 `status: FINISHED`，状态机因此是完整的；
+/// 但没有任何 RESPONSE 分片就说明这一轮没给出答案，此前会被判成 `Complete`，
+/// 会话被留在账号上，下一轮复用同一条空消息的 `parent_message_id` 继续拿到空回复。
+/// 空回复按截断处理：归还会话、触发续写（若已配置），并把 `finish_reason` 置为 `length`。
+fn settle_on_finish(patch_state: &PatchState, outcome: &mut StreamOutcome) {
+    if !patch_state.response_has_content && *outcome == StreamOutcome::Complete {
+        log::warn!(
+            target: "ds_core::accounts",
+            "上游正常结束但无 RESPONSE 分片，按截断处理: status={:?}",
+            patch_state.status
+        );
+        // 必须同时清掉 WIP 状态：此后 `classify_outcome` 若再看到 WIP，
+        // 会按「仍在生成」返回 Incomplete，续写判定重新变得不确定。
+        *outcome = StreamOutcome::Truncated;
     }
 }
 
@@ -708,14 +745,25 @@ impl Stream for ResponseStream {
                         *this.outcome,
                     );
                     if !plan.resume {
+                        settle_on_finish(this.patch_state, this.outcome);
+                        // finalize_events / cycle_flush 可能已经把 phase 推到 Done，
+                        // 所以「结束前是否已产出正文」要在这里先留住。
+                        let produced_content =
+                            this.patch_state.response_has_content || *this.phase == Phase::Content;
+                        this.session.cleanup(!this.patch_state.response_has_content);
                         *this.phase = Phase::Done;
                         *this.finished = true;
-                        this.session.cleanup(true);
-                        let finish = super::resume::finish_reason_after_resume(
-                            *this.outcome,
-                            *this.resumed_any,
-                        )
-                        .to_owned();
+                        // 空正文永远按截断上报（`length`）：`finish_reason_after_resume`
+                        // 只看 outcome，而 FINISHED+空正文在关闭续写时仍是 Complete。
+                        let finish = if produced_content {
+                            super::resume::finish_reason_after_resume(
+                                *this.outcome,
+                                *this.resumed_any,
+                            )
+                            .to_owned()
+                        } else {
+                            "length".to_owned()
+                        };
                         return Poll::Ready(Some(Ok(StreamEvent::Done {
                             finish_reason: Some(finish),
                             accumulated_token_usage: None,
@@ -726,9 +774,13 @@ impl Stream for ResponseStream {
                     let Some(replier) = this.replier.as_mut() else {
                         *this.phase = Phase::Done;
                         *this.finished = true;
-                        this.session.cleanup(true);
+                        this.session.cleanup(!this.patch_state.response_has_content);
                         return Poll::Ready(None);
                     };
+                    // 空回复不留会话：复用它只会把同一个 parent 反复续成空
+                    if !this.patch_state.response_has_content {
+                        this.session.cleanup(false);
+                    }
                     *this.resume_attempts += 1;
                     let ticket = super::resume::ResumeTicket {
                         session_id: this.session.session_id.clone(),
@@ -886,11 +938,17 @@ fn hint_to_error(data: &str) -> CoreError {
 /// 正常循环与「流意外结束（EOF）时冲刷缓冲区」两条路径共用，
 /// 避免 EOF 路径丢失上游已经下发的 `finish_reason` 与 `accumulated_token_usage`。
 fn finalize_events(
-    patch_state: &PatchState,
+    patch_state: &mut PatchState,
     phase: &mut Phase,
     events: Vec<StreamEvent>,
     out: &mut VecDeque<StreamEvent>,
 ) -> Option<bool> {
+    // 本帧新产生的内容也算「有正文」：`finalize_events` 只看事件流，
+    // 不能依赖 `PatchState.response_has_content` 已经在别处被写过。
+    let has_content = patch_state.response_has_content
+        || events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ContentDelta { .. }));
     let mut incomplete = None;
     for evt in events {
         match &evt {
@@ -909,21 +967,26 @@ fn finalize_events(
         out.push_back(evt);
     }
 
-    if let Some(status) = &patch_state.status
-        && matches!(status.as_str(), "FINISHED" | "INCOMPLETE" | "WIP")
-        && *phase != Phase::Done
-    {
+    let terminal_status = patch_state
+        .status
+        .as_deref()
+        .filter(|s| matches!(*s, "FINISHED" | "INCOMPLETE" | "WIP"))
+        .filter(|_| *phase != Phase::Done)
+        .map(str::to_string);
+    if let Some(status) = terminal_status {
         *phase = Phase::Done;
-        // INCOMPLETE 是上游的「先这样」结束：给出 length 让上层知道输出不完整
-        // （否则会被当成正常结束），是否续写由 supervisor 决定。
-        let is_incomplete = status == "INCOMPLETE";
-        let finish = (!is_incomplete).then(|| "stop".to_string());
+        // 空正文（零 RESPONSE 分片）一律按截断收尾：上游对空回复也照样下发
+        // FINISHED，若照 status 判成 Complete，会话会留在账号上被复用，下一轮
+        // 继续拿到空回复，客户端也看不到「没说完」。
+        // INCOMPLETE 是上游的「先这样」结束：同样上报 length，是否续写交给 supervisor。
+        let is_incomplete = !has_content;
+        let finish = has_content.then(|| "stop".to_string());
         incomplete = Some(is_incomplete);
         let usage = patch_state.accumulated_token_usage;
-        if finish.is_some() && !has_response_content(patch_state) {
+        if is_incomplete && !patch_state.response_has_content {
             log::warn!(
                 target: "ds_core::accounts",
-                "状态机 FINISHED 但无 RESPONSE 内容"
+                "状态机已结束但无 RESPONSE 内容: status={status}，按截断上报 finish_reason=length"
             );
         }
         out.push_back(StreamEvent::Done {
@@ -934,11 +997,6 @@ fn finalize_events(
     incomplete
 }
 
-/// 检查是否有非空的 RESPONSE 内容（用于 FINISHED 告警）
-const fn has_response_content(state: &PatchState) -> bool {
-    state.response_has_content
-}
-
 /// 判定上游流结束的收尾类型（供上层 supervisor 决定是否自动续写）
 ///
 /// - `status = FINISHED` → `Complete`
@@ -946,6 +1004,9 @@ const fn has_response_content(state: &PatchState) -> bool {
 /// - 其它（`WIP`、无 status、已断流）→ `Truncated`
 fn classify_outcome(state: &PatchState) -> StreamOutcome {
     match state.status.as_deref() {
+        // 「FINISHED 但零 RESPONSE 分片」= 上游主动截流，绝不能算 Complete：
+        // 否则空回复会被 cleanup(true) 归还复用池，后续每轮都挂在同一个空 parent 上。
+        Some("FINISHED") if !state.response_has_content => StreamOutcome::Truncated,
         Some("FINISHED") => StreamOutcome::Complete,
         Some("INCOMPLETE") => StreamOutcome::Incomplete,
         _ => StreamOutcome::Truncated,
@@ -1129,17 +1190,112 @@ pub(crate) async fn wait_close(
 mod tests {
     use super::*;
 
+    /// 回归：上游只镜像一帧 THINK 就带上 `WIP` 断流（真实上游偶发，见
+    /// development.md 的「只有 THINK 的短流」）时，Done 必须报 `length` 而不是 `stop`，
+    /// 否则客户端把半句思考当成完整回答。
+    #[test]
+    fn think_only_wip_stream_reports_length_not_stop() {
+        let mut state = PatchState::new();
+        let frame = r#"data: {"v":{"response":{"status":"WIP","fragments":[{"id":2,"type":"THINK","content":"We"}]}}}"#;
+        let mut phase = Phase::Init;
+        let mut out = VecDeque::new();
+        let events = state.apply_frame(frame).expect("帧应可解析");
+        finalize_events(&mut state, &mut phase, events, &mut out);
+
+        let done = out
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Done { finish_reason, .. } => Some(finish_reason.clone()),
+                _ => None,
+            })
+            .expect("WIP 终态应已追加 Done");
+        assert_eq!(done, None, "零 RESPONSE 分片时不得声称 stop");
+    }
+
+    /// 回归：`cycle_flush` 在 WIP 断流后把 outcome 判为 Truncated，
+    /// 且不能因为「有 THINK 内容」就漏掉续写判定。
+    #[test]
+    fn think_only_wip_stream_is_truncated() {
+        let mut state = PatchState::new();
+        // `take_frame` 要求 `\n\n` 分隔，帧尾空行由缓冲区补齐。
+        let mut buf = BytesMut::from(
+            concat!(
+                r#"data: {"v":{"response":{"status":"WIP","fragments":[{"id":2,"type":"THINK","content":"We"}]}}}"#,
+                "\n\n"
+            )
+            .as_bytes(),
+        );
+        let mut phase = Phase::Init;
+        let mut resume_incomplete = false;
+        let mut outcome = StreamOutcome::Truncated;
+        let flushed = cycle_flush(
+            &mut buf,
+            &mut state,
+            &mut phase,
+            &mut resume_incomplete,
+            &mut outcome,
+        );
+        assert_eq!(outcome, StreamOutcome::Truncated);
+        assert!(!state.response_has_content);
+        // WIP 断流在 `cycle_flush` 里就已收尾：Done 必须已经排队且不带 stop。
+        assert!(matches!(
+            flushed.back(),
+            Some(StreamEvent::Done {
+                finish_reason: None,
+                ..
+            })
+        ));
+    }
+
     /// 回归：上游在 status=FINISHED 之后直接断流时，`accumulated_token_usage` 与
     /// `finish_reason` 仍必须出现在 Done 事件里（issue #93：completion_tokens 恒为 0）
     #[test]
+    fn bare_delta_does_not_leak_op_into_following_status_frame() {
+        // 真实上游序列：`fragments/-1/content` APPEND → 裸增量 → 新 fragments(无 o)
+        // → 裸增量 → BATCH → 只带 p 的 `response/status`。旧实现把贴式的 APPEND 继承到
+        // status 帧，`apply_path` 的 SET 分支全部落空，状态永远停在 WIP、正文丢失。
+        let mut state = PatchState::new();
+        let frames = [
+            r#"data: {"v":{"response":{"status":"WIP","fragments":[{"id":2,"type":"THINK","content":"We"}]}}}"#,
+            r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":" need"}"#,
+            r#"data: {"v":" answer"}"#,
+            r#"data: {"p":"response/fragments","v":[{"id":2,"type":"THINK","content":"We need answer"},{"id":3,"type":"RESPONSE","content":"Hi"}]}"#,
+            r#"data: {"p":"response/fragments/-1/content","o":"APPEND","v":"!"}"#,
+            r#"data: {"p":"response/status","v":"FINISHED"}"#,
+        ];
+        let mut phase = Phase::Init;
+        let mut content = String::new();
+        let mut thinks = String::new();
+        for frame in frames {
+            let events = state.apply_frame(frame).expect("帧应可解析");
+            let mut out = VecDeque::new();
+            finalize_events(&mut state, &mut phase, events, &mut out);
+            for evt in out {
+                match evt {
+                    StreamEvent::ContentDelta { content: c } => content.push_str(&c),
+                    // 首个快照已带 "We"，后续 `fragments` 又是完整快照，思考内容会重复；
+                    // 本用例只关心 RESPONSE 片段是否被粘滞的 APPEND 吞掉。
+                    StreamEvent::ThinkDelta { content: c } => thinks.push_str(&c),
+                    _ => {}
+                }
+            }
+        }
+        assert!(thinks.contains("We need answer"));
+        assert_eq!(content, "Hi!");
+        assert_eq!(state.status.as_deref(), Some("FINISHED"));
+        assert_eq!(classify_outcome(&state), StreamOutcome::Complete);
+    }
+
+    #[test]
     fn finalize_events_keeps_usage_when_status_finished() {
         let mut state = PatchState::new();
+        state.response_has_content = true;
         state.status = Some("FINISHED".to_string());
         state.accumulated_token_usage = Some(87);
         let mut phase = Phase::Content;
         let mut out = VecDeque::new();
 
-        finalize_events(&state, &mut phase, Vec::new(), &mut out);
+        finalize_events(&mut state, &mut phase, Vec::new(), &mut out);
 
         assert_eq!(phase, Phase::Done);
         match out.make_contiguous() {
@@ -1156,6 +1312,24 @@ mod tests {
         }
     }
 
+    /// FINISHED 但零 RESPONSE 分片：不能报 stop，否则空正文会被当成正常结束
+    #[test]
+    fn finalize_events_empty_finished_reports_length() {
+        let mut state = PatchState::new();
+        state.status = Some("FINISHED".to_string());
+        let mut phase = Phase::Thinking;
+        let mut out = VecDeque::new();
+
+        finalize_events(&mut state, &mut phase, Vec::new(), &mut out);
+
+        match out.make_contiguous() {
+            [StreamEvent::Done { finish_reason, .. }] => {
+                assert_eq!(*finish_reason, None, "空正文必须让上层补成 length");
+            }
+            other => panic!("期望单个 Done 事件，实际: {:?}", other.len()),
+        }
+    }
+
     /// INCOMPLETE 不应伪装成正常结束，但仍需带上 usage
     #[test]
     fn finalize_events_incomplete_has_no_finish_reason() {
@@ -1165,7 +1339,7 @@ mod tests {
         let mut phase = Phase::Content;
         let mut out = VecDeque::new();
 
-        finalize_events(&state, &mut phase, Vec::new(), &mut out);
+        finalize_events(&mut state, &mut phase, Vec::new(), &mut out);
 
         match out.make_contiguous() {
             [
@@ -1189,7 +1363,7 @@ mod tests {
         let mut phase = Phase::Done;
         let mut out = VecDeque::new();
 
-        finalize_events(&state, &mut phase, Vec::new(), &mut out);
+        finalize_events(&mut state, &mut phase, Vec::new(), &mut out);
 
         assert!(out.is_empty(), "Done 阶段不应再追加事件: {out:?}");
     }
@@ -1204,7 +1378,7 @@ mod tests {
         let mut out = VecDeque::new();
 
         finalize_events(
-            &state,
+            &mut state,
             &mut phase,
             vec![StreamEvent::ContentDelta {
                 content: "hi".into(),

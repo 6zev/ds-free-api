@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 use crate::CoreError;
 use crate::config::{AccountConfig, DsCoreConfig};
 pub use client::{
-    COMPLETION_SOURCE_INPUT, ChatSessionInfo, ClientError, ClientIdentity, CompletionPayload,
+    COMPLETION_SOURCE_DEFAULT, ChatSessionInfo, ClientError, ClientIdentity, CompletionPayload,
     DsClient, EmulationProfile, FetchSessionsData, HifConfig, LoginPayload, StopStreamPayload,
 };
 pub use pool::{Account, AccountGuard, AccountPool, AccountStatus, PoolError};
@@ -50,6 +50,7 @@ fn build_client(config: &DsCoreConfig) -> DsClient {
             EmulationProfile::default()
         }),
         config.proxy_url.as_deref(),
+        &config.proxy_bypass_hosts,
     )
 }
 

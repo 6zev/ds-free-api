@@ -260,17 +260,23 @@ pub struct CompletionPayload {
     pub search_enabled: bool,
     /// 真实客户端固定发送该字段（会话首条为 null）
     pub action: Option<serde_json::Value>,
-    /// 消息来源（官方前端的输入方式：`input` / `click` / `keyboard` / `paste` …）
+    /// 消息来源（官方客户端的渠道标记）
     ///
     /// 2026-10-07 从前端 bundle 提取：真实客户端的 completion payload 一定带
-    /// `source`，取值是**用户如何发出这条消息**。代理侧按「键盘输入 + 发送」的
-    /// 主路径填 `input`（真实用户最常态的方式）。
+    /// `source`。早期按「输入框回车」推断为 `input`，但 2026-11-26 实测上游
+    /// 已不接受该取值 —— completion 直接 422
+    /// `unknown variant \`input\`, expected \`default\` or \`landing\``
+    /// 并连带把账号标记为 Error。现按上游实际枚举发 `default`（App / 会话内消息
+    /// 的主路径），见 `docs/development.md` 的 422 记录。
     pub source: &'static str,
     pub preempt: bool,
 }
 
-/// 代理侧统一使用的 `source` 取值（对齐真实客户端的主路径：输入框输入）
-pub const COMPLETION_SOURCE_INPUT: &str = "input";
+/// 代理侧统一使用的 `source` 取值
+///
+/// 上游只接受 `default` / `landing`；旧值 `input` 会让 `/chat/completion` 返回
+/// HTTP 422（`unknown variant \`input\`），因此对齐为 `default`。
+pub const COMPLETION_SOURCE_DEFAULT: &str = "default";
 
 #[derive(Debug, Serialize)]
 #[allow(dead_code)]
@@ -493,10 +499,18 @@ impl DsClient {
         hif: &HifConfig,
         emulation: EmulationProfile,
         proxy_url: Option<&str>,
+        proxy_bypass_hosts: &[String],
     ) -> Self {
         let mut builder = wreq::Client::builder().emulation(emulation.to_wreq());
         if let Some(url) = proxy_url.and_then(|u| wreq::Proxy::all(u).ok()) {
-            builder = builder.proxy(url);
+            // `no_proxy`：SOCKS5 按域名转发时由代理端解析，本地 hosts 不生效，
+            // 所以本地 mock / 自建中转必须在这里显式跳过。
+            let proxy = if proxy_bypass_hosts.is_empty() {
+                url
+            } else {
+                url.no_proxy(wreq::NoProxy::from_string(&proxy_bypass_hosts.join(",")))
+            };
+            builder = builder.proxy(proxy);
         }
         // 设备身份必须由调用方显式提供：真实 Web 客户端的 device_id 是浏览器登录时
         // 由数美 SDK 生成的，拿不到就登录不了（biz_code 11）。这里再「按 api_base 派生
@@ -1066,6 +1080,7 @@ mod tests {
             &HifConfig::default(),
             EmulationProfile::default(),
             None,
+            &[],
         )
     }
 
@@ -1138,6 +1153,7 @@ mod tests {
             &HifConfig::default(),
             EmulationProfile::default(),
             None,
+            &[],
         );
         assert_eq!(
             c.client_headers().unwrap()["x-device-id"],
@@ -1194,6 +1210,30 @@ mod tests {
         );
     }
 
+    /// 回归：上游 `/chat/completion` 的 `source` 只接受 `default` / `landing`。
+    /// 发 `input` 会得到 HTTP 422（`unknown variant `input`），账号随即被标记 Error。
+    #[test]
+    fn completion_source_is_accepted_upstream() {
+        assert_eq!(COMPLETION_SOURCE_DEFAULT, "default");
+        let payload = CompletionPayload {
+            chat_session_id: "s".to_string(),
+            parent_message_id: None,
+            model_type: "default".to_string(),
+            prompt: "hi".to_string(),
+            ref_file_ids: Vec::new(),
+            thinking_enabled: false,
+            search_enabled: false,
+            action: None,
+            source: COMPLETION_SOURCE_DEFAULT,
+            preempt: false,
+        };
+        let json = serde_json::to_string(&payload).expect("序列化失败");
+        assert!(
+            json.contains(r#""source":"default""#),
+            "completion payload 必须发 source=default：{json}"
+        );
+    }
+
     #[test]
     fn hif_can_be_disabled() {
         let c = DsClient::new(
@@ -1206,6 +1246,7 @@ mod tests {
             },
             EmulationProfile::default(),
             None,
+            &[],
         );
         assert!(c.hif.is_none(), "关闭后不应构造 HIF 令牌提供者");
     }

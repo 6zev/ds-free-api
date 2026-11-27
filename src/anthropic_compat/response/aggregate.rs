@@ -40,11 +40,12 @@ pub fn from_chat_completions(resp: &ChatCompletionsResponse) -> MessagesResponse
         }
     }
 
-    // Anthropic 的非流式响应 `stop_reason` 必须非空
+    // Anthropic 的非流式响应 `stop_reason` 必须非空。缺省原因来自 `ds_core` 的
+    // 「零 RESPONSE 分片」截断判定，按 `max_tokens` 上报（`end_turn` 会掩盖截断）。
     let stop_reason = choice
         .and_then(|c| c.finish_reason)
         .map(finish_reason_map)
-        .or_else(|| Some("end_turn".to_string()));
+        .or_else(|| Some("max_tokens".to_string()));
 
     let usage = resp.usage.as_ref().map_or(
         Usage {
@@ -366,7 +367,7 @@ mod tests {
         };
         let msg = from_chat_completions(&r);
         assert!(msg.content.is_empty());
-        // 无 choices 时没有 finish_reason，退化为 end_turn（Anthropic 要求非空）
-        assert_eq!(msg.stop_reason.as_deref(), Some("end_turn"));
+        // 无 choices = 拿不到任何正文，属于截断，按 max_tokens 上报（Anthropic 要求非空）
+        assert_eq!(msg.stop_reason.as_deref(), Some("max_tokens"));
     }
 }

@@ -510,7 +510,9 @@ where
         }
 
         if let Some(choice) = chunk.choices.into_iter().next() {
-            if finish_reason.is_none() {
+            // 结束原因取**最后一次**出现：`length`（截断）只会出现在收尾 chunk 上，
+            // 首次出现的 `stop` 来自中途补发的合成结束，保留它会把截断伪装成正常结束。
+            if choice.finish_reason.is_some() {
                 finish_reason = choice.finish_reason;
             }
             if let Some(c) = choice.delta.content {

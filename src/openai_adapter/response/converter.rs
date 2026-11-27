@@ -48,6 +48,19 @@ pub(crate) fn make_chunk(
     }
 }
 
+/// 上游 SSE 结束原因的兜底取值
+///
+/// `ds_core` 只有在「零 RESPONSE 分片」时才给 `None`（见
+/// `ds_core/src/chat/response.rs::finalize_events`），所以缺省一律按截断上报 ——
+/// OpenAI 的 `length` 同时会被 Anthropic（`max_tokens`）与 Responses（`incomplete`）映射。
+pub(crate) fn finish_reason_default(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("tool_calls") => "tool_calls",
+        Some("stop") => "stop",
+        _ => "length",
+    }
+}
+
 pin_project! {
     // 将 StreamEvent 增量事件映射为 OpenAI ChatCompletionsResponseChunk 的流转换器
     pub struct ConverterStream<S> {
@@ -146,13 +159,10 @@ where
                     } => {
                         trace!(target: "adapter", ">>> conv: finish={finish_reason:?}");
                         *this.finished = true;
-                        // 采用上游给出的结束原因（如 length），未知/缺省才退化为 stop；
-                        // 硬编码 "stop" 会把「被截断」伪装成「正常结束」
-                        let finish = match finish_reason.as_deref() {
-                            Some("length") => "length",
-                            Some("tool_calls") => "tool_calls",
-                            _ => "stop",
-                        };
+                        // 缺省（`None`）= `ds_core` 判定「零 RESPONSE 分片、按截断收尾」，
+                        // 必须给它一个明确的 `length`：兜底 `stop` 会把截断伪装成正常结束，
+                        // 客户端于是把半句思考当完整回答。
+                        let finish = finish_reason_default(finish_reason.as_deref());
                         let mut chunk = make_chunk(this.model, Delta::default(), Some(finish));
                         if *this.include_usage
                             && let Some(u) = accumulated_token_usage

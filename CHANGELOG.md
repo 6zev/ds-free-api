@@ -4,6 +4,98 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.2] - 2026-11-26
+
+### 修复：`source = "input"` 被上游拒绝导致「能登录但无法对话」（HTTP 422）
+
+- **根因**：`/chat/completion` 请求体里的 `source` 字段。`017954a` 起代理固定发
+  `source = "input"`（按「输入框回车」推断）。2026-11-26 实测上游已把该字段收紧成
+  枚举，只接受 `default` / `landing`，其余取值直接 422：
+  `unknown variant `input`, expected `default` or `landing` at line 1 column 106030`。
+- **放大效应**：422 在 SSE 建立之前返回，被 `completion()` 当作
+  `ClientError::Status`，账号随即 `mark_error`（`Busy → Error`）。池里每发起一次请求
+  就少一个可用账号，客户端只看到 `overloaded` 反复重试 —— 看起来像「并发/限流」，
+  实际是请求体字段错误。**登录、check_device、建会话都是健康的**，与风控无关。
+- **改动**：`COMPLETION_SOURCE_INPUT` 的取值从 `input` 改为 `default`（上游实际接受的
+  枚举），并改名为 `COMPLETION_SOURCE_DEFAULT`（五个构造点同步更新）。
+- 文档同步：`ds_core/raw-api-reference.md` §0.5 + completion 示例、
+  `docs/development.md`（默认值表 + 2026-11-26 422 记录）、`AGENTS.md`。
+
+### 修复：SSE 补丁的 `p`/`o` 粘滞状态泄漏，导致回复正文为空
+
+- **根因**：上游 SSE 的裸增量帧（`{"v":" there"}`）省略 `p`/`o`，沿用上一帧的
+  `response/fragments/-1/content` + `APPEND`。解析器把这份「粘滞」状态从**帧级**
+  放大成**流级**：后续显式帧 `{"p":"response/status","v":"FINISHED"}` 自身没带
+  `o`，于是继承了 `APPEND`，`apply_path` 里所有 SET 分支被整段跳过 —— 状态永远停在
+  `WIP`，`classify_outcome` 判定为 `Truncated`，日志出现
+  `状态机 FINISHED 但无 RESPONSE 内容`，客户端只拿到思考片段。
+- **改动**：`PatchState` 的粘滞字段改为一次性语义（`.take()`）——显式给出的 `p`/`o`
+  只对当前帧有效，下一帧必须重新给出；裸数组的 `APPEND` 推断保留在
+  `path.ends_with("fragments")` 的分支里。新增回归测试
+  `bare_delta_does_not_leak_op_into_following_status_frame`。
+- **验证**：真实账号抓包确认上游确实先发裸增量、再发带 `o: "SET"` 的 status 帧；
+  修后 OpenAI / Anthropic / Responses 三条链路均能拿到完整正文，`reuse` 模式第二轮
+  增量复用（`parent_message_id` + 单条新消息）同样正常。
+
+### 修复：零正文收流在适配层被改写回 `stop`（`finish_reason` 传播链）
+
+- **根因**：`ds_core` 在无正文终局时发出的 `Done { finish_reason: None }`，到适配层被
+  `ConverterStream` 的兜底分支 `None => "stop"` 改写成正常结束；Anthropic 侧
+  `if let Some(reason)` 干脆忽略 `None`，回落成 `end_turn`。于是「上游截断」在三条协议上
+  都显示成「模型说完了」。
+- **改动**：`ConverterStream` 的 `Done` 兜底改为「有正文才 `stop`，无正文 `length`」，
+  Anthropic / Responses 侧同步把缺省原因当成截断。
+- 新增回归测试 `think_only_wip_stream_reports_length_not_stop` /
+  `think_only_wip_stream_is_truncated`：THINK-only 的 WIP 短流必须判 `Truncated` 且
+  `Done.finish_reason == None`（由适配层映射成 `length`）。
+
+### 修复：`[ds_core.auto_resume]` 热重载不生效（只有重启才生效）
+
+- **根因**：`Chat` 在 `DsCore` 里只构造一次，`auto_resume` 是普通字段；`reload_config`
+  只重建账号池的 client/solver，从不回写 `Chat`。管理面板改「截断续写」开关后，
+  实际生效的仍是启动时那份配置。
+- **改动**：`Chat.auto_resume` 改为 `RwLock<AutoResumeConfig>`，新增
+  `Chat::reload_auto_resume()`，由 `DsCore::reload_config` 在重载账号池前调用。
+
+### 修复：上游「FINISHED 但零 RESPONSE 分片」被当成正常结束，空回复被缓存成可复用会话
+
+- **根因**：上游偶发地以「`status = FINISHED` + 只有 THINK 片段、没有任何 RESPONSE 片段」
+  的方式收流（HTTP 200，非错误信封，也非 422）。状态机据此判定 `Complete`，于是
+  `session.cleanup(true)` 把这条**空会话**归还进复用池；之后每一轮都在同一个
+  `parent_message_id` 上续问，客户端持续拿到空正文，`completion_tokens = 0`。
+- **改动**：新增 `settle_on_finish()` —— 只在「有状态终局且 `response_has_content == false`」
+  时把 `StreamOutcome::Complete` 降级为 `Truncated`，并记录 `status`。判定点放在 EOF 收尾
+  分支（`plan_resume` 之前），因此空回复不会被缓存、`finish_reason` 变成 `length`，
+  supervisor 仍可续写；`cleanup(true)` 也随之从该分支移除（会话在被复用前必须真的产出正文）。
+- **注意**：这是**防御性**修复 —— 抓包确认上游对部分账号/提示形状会返回 THINK-only 的短流
+  （3 帧：`ready` → `update_session` → 只含 THINK 片段的 `WIP` 快照，随后直接 EOF）。
+  该路径下我们只能保证「不污染会话池 + 客户端拿到 `finish_reason = length` 而不是假的 `stop`」，
+  不承诺凭空产生正文。
+- 新增日志（`ds_core::accounts`）：`上游正常结束但无 RESPONSE 分片，按截断处理: status=…`。
+
+### 修复：工具调用流在收尾时丢正文 / 重复发 `tool_calls`（同步补齐）
+
+- **丢正文**：`ToolCallStream` 在流结束仍未闭合 XML 标签的分支原本直接 `continue`，
+  累积的文本被静默丢弃，客户端拿到空回复。现在把缓冲内容回填成
+  `delta.content` 后再退出检测状态。
+- **重复 `tool_calls`**：`ToolParseState::Done` 在流尾无条件补一个 `finish_reason =
+  "tool_calls"` 的收尾块，而解析成功时已经发过一次。改为用 `finish_emitted` 去重。
+- **收尾未落 `finish_reason`**：`Detecting` / `CollectingXml` 两个状态在 finish 分支
+  补上 `finish_emitted = true`，`stop → tool_calls` 的改写只在**确实解析出非空
+  `tool_calls`** 时发生，避免把截断误标成工具调用。
+
+### 新增：`[proxy] bypass_hosts`（本地 mock / 自建中转直连）
+
+- SOCKS5 按域名转发时由代理端解析，本地 `hosts` 不生效，于是本地 mock 上游 / 自建中转
+  会被代理吞掉。新增 `bypass_hosts = ["localhost", "mock.lan"]`，命中后缀的主机不走代理。
+- 打通 `ProxyConfig` → `DsCoreConfig.proxy_bypass_hosts` → `DsClient::new` 的
+  `NoProxy` 链路；管理面板 `SettingsPage` 增加对应输入框（逗号分隔），
+  `config.example.toml` / `docker/config.example.toml` 同步文档。
+- 验证：`account_check` 在代理地址改成不可达的 `socks5h://127.0.0.1:1` 后仍能登录 mock，
+  说明 `mock.lan` 确实被跳过。
+- `scripts/risk-experiment/mock_upstream.py`：兼容加密登录体（`login_encryption = true`
+  时 body 是密文，mock 不再因 `UnicodeDecodeError` 崩掉），并支持 `MOCK_HOST` 绑定地址。
+
 ## [0.6.1] - 2026-11-26
 
 ### 修复：默认身份整体对齐安卓 App，绕开 AWS WAF 202 challenge（行为变更）

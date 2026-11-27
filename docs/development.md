@@ -848,7 +848,118 @@ UA / `client_platform` / `client_os` 切成 web，则应同时设 `emulation = "
 | `emulation` | `okhttp4_12` | `chrome136` | 官方 Web 客户端 = 桌面 Chrome |
 | `user_agent` | `DeepSeek/2.5.0 Android/35` | 桌面 Chrome/140 | 同上 |
 | `client_platform` / `client_os` | `android` | `web` | 同上 |
-| completion payload | 无 `source` | `source = "input"` | 前端 bundle：官方一定带该字段 |
+| completion payload | 无 `source` | `source = "default"` | 前端 bundle：官方一定带该字段；`input` 已被上游拒绝（422） |
+
+#### 2026-11-26：`source = "input"` 被上游拒绝（HTTP 422，登录正常但无法对话）
+
+现象：账号登录、`session_created` 全部成功，紧接着 `/chat/completion` 返回
+
+```
+HTTP status 422: ... unknown variant `input`, expected `default` or `landing` at line 1 column 106030
+```
+
+随后该账号被 `mark_error`（`Busy → Error`），池内再没有可用账号，客户端只看到
+`overloaded` 重试。**登录链路与风控无关** —— 是 completion 请求体的字段枚举变了。
+
+`COMPLETION_SOURCE_INPUT` 的取值从 `input` 改为 `default`（上游实际接受的枚举），
+常量名保持不变以免大范围改调用点。`docs/` 旧 catch 包里的 `input` 结论作废。
+
+> 待实测确认：`default` / `landing` 的语义差异（推测 `landing` 用于「首页新会话首条消息」，
+> `default` 用于会话内消息）。两种取值长度相同，只影响错误列的偏移，不影响判断。
+
+#### 2026-11-26：SSE 帧的 `p` / `o` 粘滞语义（回复正文为空的根因）
+
+真实账号抓包（`default` + `thinking_enabled`）的帧序列：
+
+```
+data: {"v":{"response":{... "status":"WIP", "fragments":[{"id":2,"type":"THINK","content":"We"}]}}}
+data: {"p":"response/fragments/-1/content","o":"APPEND","v":" need"}
+data: {"v":" answer"}                 ← 裸增量：省略 p/o，沿用上一帧
+...
+data: {"p":"response/fragments","v":[THINK 全量, {"id":3,"type":"RESPONSE","content":"Hello"}]}
+data: {"p":"response/fragments/-1/content","o":"APPEND","v":" there"}
+data: {"v":" friend"}
+data: {"p":"response","o":"BATCH","v":[{"p":"accumulated_token_usage","v":70}, ...]}
+data: {"p":"response/status","o":"SET","v":"FINISHED"}   ← 带 o
+```
+
+结论：`p`/`o` 的缺省只继承**上一帧**，不是「流级默认值」。解析器此前把粘滞状态一直
+保留到下一次显式赋值，于是任何自身不带 `o` 的帧（`{"p":"response/status","v":...}`）
+都会拿到上一个 `APPEND` 而被静默丢弃 —— 状态机永远停在 `WIP`，`classify_outcome`
+返回 `Truncated`，日志里是 `状态机 FINISHED 但无 RESPONSE 内容`。
+现在 `PatchState` 的 `sticky_path` / `sticky_op` 用 `.take()` 消费，语义为一次性。
+`BATCH` 的内层条目本来就不带 `p`（靠父路径），`apply_batch` 有独立子解析器，不受影响。
+
+#### 2026-11-27：THINK-only 短流（FINISHED 但零 RESPONSE 分片）
+
+同一账号在 OpenAI / Anthropic / Responses 三条链路上都复现过：
+
+```
+event: ready          data: {"request_message_id":1,"response_message_id":2,"model_type":"default"}
+event: update_session data: {"updated_at":1795743827.363797}
+data: {"v":{"response":{"message_id":2,"parent_id":1,"status":"WIP",
+        "fragments":[{"id":2,"type":"THINK","content":"The",...}]}}}   ← 只有 THINK
+EOF
+```
+
+三帧之后直接断流，没有 `p`、没有 `o`、没有任何 RESPONSE 片段。这不是解析问题
+（同样的解析器对 `/tmp` 里的正常抓包能拿到完整正文），而是上游对该账号/提示形状的
+**主动截流**：HTTP 200、无错误信封、无 `biz_code`。
+
+修复后的行为：
+
+- `settle_on_finish()` 在 EOF 收尾（`plan_resume` 之前）把这种「终局但无正文」的
+  `Complete` 降级为 `Truncated` —— 会话**不会**被 `cleanup(true)` 归还复用池，
+  `finish_reason` 变成 `length` 而不是假的 `stop`，客户端能看出输出不完整；
+- 日志：`ds_core::accounts` 的 `上游正常结束但无 RESPONSE 分片，按截断处理: status=…`。
+
+未解决：不产生正文本身无法由客户端修复。若某账号持续命中该路径，应换账号或
+检查该账号的 `mute` / `device_id` 状态，而不是继续复用它的会话。
+
+**适配层传播（同一规则的三条协议出口）**：`ds_core` 只在「零 RESPONSE 分片」时发出
+`Done { finish_reason: None }`，三个适配层必须把 `None` 映射成截断而不是正常结束：
+
+| 协议 | 出口 | `None` → |
+|------|------|----------|
+| OpenAI Chat Completions | `finish_reason` | `length`（聚合响应同样） |
+| Anthropic Messages | `stop_reason` | `max_tokens` |
+| Responses API | `status` / `incomplete_details.reason` | `incomplete` / `max_output_tokens` |
+
+`ConverterStream::finish_reason_default` 是 OpenAI 侧的唯一判定点（有正文才 `stop`）；
+Anthropic 的 `Poll::Ready(None)` 收尾与聚合兜底都改为 `max_tokens`；Responses 的
+`resolve_status` 把 `Some("length") | None` 归入 `incomplete`，并**不再补发**
+`response.completed`（只有 `response.incomplete`）。
+
+聚合（非流式）路径按「最后一个非空 `finish_reason`」取值，绝不凭空补 `stop` ——
+`response.rs:646` 的 `has_content.then(|| "stop")` 只在整段完全没有上游原因时才生效。
+
+用本地假上游做零账号验证（`MOCK_THINK_ONLY=1`，见
+`scripts/risk-experiment/mock_upstream.py`），真实二进制的四个出口实测：
+
+```
+OpenAI  stream     → finish_reason: "length"
+OpenAI  non-stream → finish_reason: "length"
+Anthropic stream   → stop_reason: "max_tokens"
+Anthropic non-stream → stop_reason: "max_tokens"
+Responses stream   → event: response.incomplete  reason=max_output_tokens（无 response.completed）
+Responses non-stream → status=incomplete  incomplete_details.reason=max_output_tokens
+```
+
+#### 本地假上游：`[proxy] bypass_hosts` 与加密登录体
+
+用 `api_base = "http://mock.lan:8098/api/v0"` 把真实二进制指向本地 mock 时有两个坑：
+
+1. **SOCKS5 会吞掉本地主机名** —— 代理端按域名解析，本地 `hosts` 不生效。必须在
+   `[proxy]` 里加 `bypass_hosts = ["mock.lan"]`（后缀匹配），否则登录报
+   `error sending request … (SendRequest)`。验证方法：把 `url` 改成不可达的
+   `socks5h://127.0.0.1:1`，若仍能登录成功，说明 bypass 生效。
+2. **`login_encryption = true` 时登录体是 AES 密文** —— mock 不解密，遇到非 UTF-8
+   body 会 `UnicodeDecodeError` 崩掉，表现为账号初始化失败。mock 已改为兜底
+   （把请求当合法登录），仅作调试用。
+
+`[ds_core.auto_resume]` 现在支持热重载：`Chat.auto_resume` 是 `RwLock`，
+`DsCore::reload_config` 会先原地刷新它，再重建账号池 —— 管理面板改「截断续写」
+开关无需重启。
 
 ### prompt 形态对齐（delta 发送，已实现）
 

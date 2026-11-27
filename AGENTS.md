@@ -648,6 +648,7 @@ Follow `docs/code-style.md`:
 |-------|---------|--------------------|
 | WASM load failure | `PowError::Execution` on startup | DeepSeek recompiled WASM. PowSolver now uses dynamic export probing (no hardcoded symbols). Update `wasm_url` in `config.toml` if WASM URL changed |
 | WAF blocking (non-US) | AWS WAF Challenge response (status 202) | Configure a non-US proxy in `config.toml` `[proxy]` |
+| Local mock / self-hosted relay unreachable | `error sending request for url (http://mock.lan:8098/...)` with a proxy configured | SOCKS5 resolves hostnames at the proxy end, so local `hosts` never applies. Add the suffix to `[proxy] bypass_hosts = ["mock.lan"]` (threaded as `wreq::NoProxy`) |
 | WAF blocking (fingerprint) | HTTP 403 / connection reset / 202 challenge | `wreq` uses BoringSSL; the fingerprint is chosen by `emulation` (`okhttp4_12` **default** = native Android app, matching the default Android identity; `chrome136` = desktop Chrome, only usable when the network's WAF lets web identities through). AWS WAF issues a JS challenge (HTTP 202) to desktop-browser identities that this client cannot solve, so keep the identity self-consistent (UA ↔ `client_platform` ↔ `client_os` ↔ emulation) — switching to web means switching **all four** to web. Verify with `cargo run -p ds_core --example identity_probe` — it hits only unauthenticated endpoints, no account traffic |
 | Account init failure | All accounts stuck in init | Bad credentials (login fails first) or rate-limited (too many sessions). Check `[accounts]` in config |
 | Login fails with `RISK_DEVICE_DETECTED` (biz_code 11) | `客户端错误: Business error: code=11, msg=RISK_DEVICE_DETECTED` during account init | DeepSeek requires a browser-registered device fingerprint. Capture `device_id` from a real browser login (`POST /api/v0/users/login`) and set it per account in `config.toml` / the admin panel |
@@ -690,7 +691,7 @@ Follow `docs/code-style.md`:
 | HTTP server/routes | `src/server/` | handlers → stream → error; `request_id_middleware` mints `req-{n}` + `x-request-id` |
 | Idempotency cache | `src/server/idempotency.rs` | `Idempotency-Key` scope/conflict/replay rules + `RecordingStream` for SSE replay |
 | PoW WASM solver | `ds_core/src/accounts/pow.rs` | wasmtime loading, dynamic export probing, DeepSeekHashV1 |
-| DeepSeek HTTP client | `ds_core/src/accounts/client.rs` | `Envelope::into_result()`, WAF detection, all API methods. `ClientIdentity::headers(FetchSite)` also overrides wreq's navigation-style defaults with the captured XHR header set; `CompletionPayload` carries `source = "input"` like the official client |
+| DeepSeek HTTP client | `ds_core/src/accounts/client.rs` | `Envelope::into_result()`, WAF detection, all API methods. `ClientIdentity::headers(FetchSite)` also overrides wreq's navigation-style defaults with the captured XHR header set; `CompletionPayload` carries `source = "default"` — upstream now rejects `input` with HTTP 422 (`unknown variant `input`, expected `default` or `landing`) |
 | HIF risk-control tokens | `ds_core/src/accounts/hif.rs` | `x-hif-leim` **and** `x-hif-dliq`: two isomorphic no-auth endpoints, TTL from `x-hif-ttl`, per-device buckets, attached to SSE requests only (whichever is available). Missing them marks the request as a non-official client — see `docs/development.md` (2026-10-07) |
 | Unified debug CLI | `examples/adapter_cli.rs` | Modes: chat/raw/compare/concurrent/status/models |
 | Risk-token probe | `examples/hif_probe.rs` | Checks the `hif-leim` endpoint only — **no account traffic** (`hif-dliq` is NXDOMAIN in some networks; the browser also fails to fetch it there) |
@@ -711,7 +712,7 @@ Follow `docs/code-style.md`:
 | i18n key-set gate | `web/scripts/check-locales.mjs` | Fails CI when the three locale files diverge |
 | Frontend config parity gate | `web/scripts/check-config-parity.mjs` | Every field in `config.example.toml` must appear somewhere under `web/src` (or be listed in `web/scripts/config-parity-allowlist.txt` with a reason). Guards the "backend adds a field, admin panel writes it back empty" class of bug |
 | Config example drift gate | `scripts/check-config-drift.sh` | Root and `docker/` config examples must stay identical except `host` |
-| Config example (authoritative) | `config.example.toml` + `docker/config.example.toml` | Both must document every config field; the docker copy differs only in `host` |
+| Config example (authoritative) | `config.example.toml` + `docker/config.example.toml` | Both must document every config field; the docker copy differs only in `host`. `[proxy] bypass_hosts` = hostname suffixes that skip the proxy (local mock / self-hosted relay; SOCKS5 resolves names at the proxy end, so local `hosts` is ignored) |
 | Responses e2e | `py-e2e-tests/test_responses.py` | `just e2e-responses` — streaming, tools, `previous_response_id`, error envelopes |
 | Release workflow | `.github/workflows/release.yml` | Tag `v*` → 8 targets, 4 platforms, CHANGELOG release |
 | Code style | `docs/code-style.md` | 注释、命名、错误消息约定 |

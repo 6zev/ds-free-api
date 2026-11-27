@@ -26,6 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &HifConfig::default(),
         ds_core::EmulationProfile::default(),
         None,
+        &[],
     );
 
     println!("warm_up_hif() ...");

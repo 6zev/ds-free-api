@@ -161,7 +161,9 @@
     },
     "proxy": {
       "url": "URL Proxy (kosongkan untuk menonaktifkan)",
-      "placeholder": "http://127.0.0.1:7890"
+      "placeholder": "http://127.0.0.1:7890",
+      "bypassHosts": "Host yang melewati proxy (pisahkan dengan koma)",
+      "bypassPlaceholder": "localhost, .lan"
     }
   },
   "settings": {

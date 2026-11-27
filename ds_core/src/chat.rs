@@ -39,7 +39,10 @@ pub struct Chat {
     /// 是否复用账号会话（真实客户端一个会话长期复用；默认关闭 = 每轮建删）
     session_reuse: bool,
     /// 长思考保护（心跳 + 截断续写）
-    auto_resume: AutoResumeConfig,
+    ///
+    /// 热重载会替换整段配置，因此必须可写：`Chat` 在 `DsCore` 里是唯一实例，
+    /// 不回写这里的话管理面板改 `[ds_core.auto_resume]` 只有重启才生效。
+    auto_resume: std::sync::RwLock<AutoResumeConfig>,
 }
 
 impl Chat {
@@ -51,7 +54,7 @@ impl Chat {
             model_types: config.model_types.clone(),
             input_character_limits: config.input_character_limits.clone(),
             session_reuse: config.session_policy == "reuse",
-            auto_resume: config.auto_resume.clone(),
+            auto_resume: std::sync::RwLock::new(config.auto_resume.clone()),
         }
     }
 
@@ -97,6 +100,15 @@ impl Chat {
             .and_then(|i| self.input_character_limits.get(i))
             .copied()
             .map_or(163_840, |v| v as usize)
+    }
+
+    /// 热重载长思考保护配置（心跳间隔 / 截断续写开关）
+    ///
+    /// 必须在 `DsCore::reload_config` 里调用：`Chat` 在 `DsCore` 中是唯一实例，
+    /// 只重建账号池客户端而不回写这里，管理面板改的 `[ds_core.auto_resume]`
+    /// 要重启才生效。
+    pub(crate) fn reload_auto_resume(&self, config: &AutoResumeConfig) {
+        *self.auto_resume.write().expect("auto_resume 锁中毒") = config.clone();
     }
 
     /// 优雅关闭：清理所有残留的活跃 session
