@@ -68,7 +68,10 @@ struct Envelope<T> {
 struct EnvelopeData<T> {
     biz_code: i64,
     biz_msg: String,
-    biz_data: Option<T>,
+    /// 先当 `Value` 读，再转成 `T`：上游「无返回值」接口会给 `{}` 而不是 `null`
+    biz_data: Option<serde_json::Value>,
+    #[serde(skip)]
+    _marker: std::marker::PhantomData<T>,
 }
 
 impl<T: serde::de::DeserializeOwned> Envelope<T> {
@@ -89,16 +92,19 @@ impl<T: serde::de::DeserializeOwned> Envelope<T> {
                 msg: data.biz_msg,
             });
         }
-        data.biz_data.map_or_else(
-            || {
-                // 允许 biz_data 为 null，尝试从 null 构造 T（仅当 T 是 Option 时成功）
-                serde_json::from_value(serde_json::Value::Null).map_err(|_| ClientError::Business {
-                    code: -1,
-                    msg: "missing biz_data".into(),
-                })
-            },
-            Ok,
-        )
+        // 上游的「无返回值」接口两种形态都出现过：`biz_data: null`，以及
+        // `biz_data: {}`（`stop_stream` / `delete_session` 实测返回后者）。
+        // 旧实现把「有没有数据」直接绑到 `T` 上，`{}` 于是撞上
+        // `invalid type: map, expected unit`，正常停止被记成失败。
+        // 现在统一走「Value → T」的反序列化：`Option<()>` 接受 null 与 map，
+        // 其它类型照旧由 serde 报错，语义不变。
+        let value = match data.biz_data.unwrap_or(serde_json::Value::Null) {
+            // 空对象是「无返回值」的另一种写法：`Option<()>` 会把它按
+            // `Some(())` 解析，`Option<Option<()>>` 才能整体落成 `None`。
+            serde_json::Value::Object(map) if map.is_empty() => serde_json::Value::Null,
+            other => other,
+        };
+        serde_json::from_value(value).map_err(ClientError::Json)
     }
 }
 
@@ -551,6 +557,18 @@ impl DsClient {
         }
     }
 
+    /// 测试用：构造一个不联网、不带 HIF 的客户端（仅流层单测需要占位）。
+    #[cfg(test)]
+    pub(crate) fn offline_for_test() -> Self {
+        Self {
+            http: wreq::Client::new(),
+            api_base: "http://127.0.0.1:1".to_owned(),
+            wasm_url: String::new(),
+            identity: ClientIdentity::default(),
+            hif: None,
+        }
+    }
+
     /// 登录 payload 使用的 os 值
     pub(crate) fn client_os(&self) -> &str {
         &self.identity.client_os
@@ -807,19 +825,36 @@ impl DsClient {
         token: &str,
         target_path: &str,
     ) -> Result<ChallengeData, ClientError> {
+        let headers = self.pow_challenge_headers(Some(token)).await?;
         let resp = self
             .http
             .post(format!(
                 "{}{}",
                 self.api_base, ENDPOINT_CHAT_CREATE_POW_CHALLENGE
             ))
-            .headers(self.auth_headers(token)?)
+            .headers(headers)
             .json(&serde_json::json!({ "target_path": target_path }))
             .send()
             .await?;
         let wrapper: ChallengeWrapper = Self::parse_envelope(resp).await?;
         let challenge = wrapper.challenge;
         Ok(challenge)
+    }
+
+    /// PoW challenge 请求头：鉴权（可选）+ 风控令牌（`x-hif-leim` / `x-hif-dliq`）
+    ///
+    /// 真实客户端把风险令牌附加到**每个**业务请求上，challenge 也不例外；
+    /// 漏掉它时该请求可能被上游/代理静默丢弃，表现为「续写一直 pending」。
+    async fn pow_challenge_headers(
+        &self,
+        token: Option<&str>,
+    ) -> Result<wreq::header::HeaderMap, ClientError> {
+        let mut headers = match token {
+            Some(token) => self.auth_headers(token)?,
+            None => self.client_headers()?,
+        };
+        self.attach_hif(&mut headers).await?;
+        Ok(headers)
     }
 
     /// guest PoW challenge（登录前匿名获取，不带 Authorization）
@@ -837,7 +872,7 @@ impl DsClient {
                 "{}{}",
                 self.api_base, ENDPOINT_CHAT_CREATE_POW_CHALLENGE
             ))
-            .headers(self.client_headers()?)
+            .headers(self.pow_challenge_headers(None).await?)
             .json(&serde_json::json!({ "target_path": target_path }))
             .send()
             .await?;
@@ -981,6 +1016,16 @@ impl DsClient {
     }
 
     pub async fn get_wasm(&self) -> Result<Bytes, ClientError> {
+        // 本地样本/离线回归：允许直接用磁盘上的 wasm，避免启动强依赖外网
+        if let Some(path) = self.wasm_url.strip_prefix("file://") {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|e| ClientError::Status {
+                    status: 0,
+                    body: format!("读取本地 wasm 失败 ({path}): {e}"),
+                })?;
+            return Ok(Bytes::from(bytes));
+        }
         let resp = self.http.get(&self.wasm_url).send().await?;
         let status = resp.status();
         if !status.is_success() {
@@ -1057,6 +1102,8 @@ pub(crate) fn extract_rotate_token(rotate: &serde_json::Value) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::accounts::hif::HifKind;
 
     fn test_identity() -> ClientIdentity {
         ClientIdentity {
@@ -1234,6 +1281,52 @@ mod tests {
         );
     }
 
+    /// 回归：PoW challenge 请求也必须带 `x-hif-leim` / `x-hif-dliq`。
+    ///
+    /// 真实客户端在**所有**鉴权请求上附加风险令牌（不只是 SSE），而早些版本的
+    /// `create_pow_challenge` 用的是裸 `auth_headers`，于是「首发 completion 之前
+    /// 先算 PoW」这条路径会静默挂住（无令牌请求被上游/代理当异常流量丢弃）。
+    /// 这里用桩 HIF 端点验证头确实被带进请求构造流程。
+    #[tokio::test]
+    async fn pow_challenge_carries_hif_headers() {
+        let mut identity = test_identity();
+        identity.device_id = "11111111-2222-4333-8444-555555555555".to_string();
+        let client = DsClient::new(
+            "http://127.0.0.1:1/api/v0".to_string(),
+            "https://example.com/x.wasm".to_string(),
+            identity,
+            &HifConfig::default(),
+            EmulationProfile::default(),
+            None,
+            &[],
+        );
+        let tokens = client
+            .hif
+            .as_ref()
+            .expect("HIF 注册表应存在")
+            .tokens_for(client.device_id());
+        tokens
+            .get(HifKind::Leim)
+            .seed_for_test("leim-v", std::time::Duration::from_mins(10))
+            .await;
+        tokens
+            .get(HifKind::Dliq)
+            .seed_for_test("dliq-v", std::time::Duration::from_mins(10))
+            .await;
+
+        let headers = client
+            .pow_challenge_headers(Some("MOCK-TOKEN"))
+            .await
+            .expect("构造 challenge 请求头失败");
+        assert_eq!(headers["x-hif-leim"], "leim-v");
+        assert_eq!(headers["x-hif-dliq"], "dliq-v");
+        assert_eq!(headers["authorization"], "Bearer MOCK-TOKEN");
+        assert_eq!(
+            headers["x-device-id"],
+            "11111111-2222-4333-8444-555555555555"
+        );
+    }
+
     #[test]
     fn hif_can_be_disabled() {
         let c = DsClient::new(
@@ -1315,5 +1408,32 @@ mod tests {
         let empty: FetchSessionsData = serde_json::from_str(r#"{"chat_sessions":[]}"#).unwrap();
         assert!(empty.chat_sessions.is_empty());
         assert_eq!(empty.has_more, None);
+    }
+
+    fn envelope(biz_data: &serde_json::Value) -> Envelope<Option<()>> {
+        serde_json::from_value(serde_json::json!({
+            "code": 0,
+            "msg": "",
+            "data": { "biz_code": 0, "biz_msg": "", "biz_data": biz_data }
+        }))
+        .unwrap()
+    }
+
+    /// `stop_stream` / `delete_session` 的上游返回是 `biz_data: {}`，
+    /// 旧实现只放行 `null`，导致正常结束被记成 `invalid type: map, expected unit`。
+    #[test]
+    fn empty_object_biz_data_counts_as_ok() {
+        for payload in [serde_json::json!(null), serde_json::json!({})] {
+            let result = envelope(&payload).into_result();
+            assert!(result.is_ok(), "biz_data={payload} 应视为成功: {result:?}");
+        }
+    }
+
+    #[test]
+    fn non_empty_biz_data_for_unit_still_fails() {
+        assert!(matches!(
+            envelope(&serde_json::json!(1)).into_result(),
+            Err(ClientError::Json(_))
+        ));
     }
 }

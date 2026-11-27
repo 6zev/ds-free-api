@@ -457,9 +457,38 @@ impl Account {
     pub(crate) fn client(&self) -> DsClient {
         self.client.clone()
     }
+
+    /// 测试用：一个从不联网的账号（Invalid 状态，不会被池选中）。
+    #[cfg(test)]
+    pub(crate) fn offline_for_test() -> Self {
+        Self::new_invalid(test_config(), 0, &DsClient::offline_for_test())
+    }
+}
+
+#[cfg(test)]
+fn test_config() -> AccountConfig {
+    crate::config::AccountConfig {
+        email: "test@example.com".into(),
+        mobile: String::new(),
+        area_code: String::new(),
+        password: String::new(),
+        device_id: "test-device".into(),
+    }
 }
 
 impl AccountGuard {
+    /// 测试用：把账号状态置为 Busy 并直接构造守卫（不发任何网络请求）。
+    ///
+    /// 只在 `#[cfg(test)]` 下编译：流层单测需要构造 `ResponseStream`，而真实
+    /// 路径必须经由 `AccountPool` 领取账号。
+    #[cfg(test)]
+    pub(crate) fn busy_for_test(account: Arc<Account>) -> Self {
+        account
+            .state
+            .store(AccountState::Busy as u8, Ordering::Relaxed);
+        Self { account }
+    }
+
     pub fn account(&self) -> &Account {
         &self.account
     }

@@ -128,6 +128,8 @@ port = 22217
 # api_base = "https://chat.deepseek.com/api/v0"
 
 # WASM 文件完整 URL（PoW 计算所需，版本号会变动，建议手动更新）
+# 也接受 `file:///abs/path/sha3.wasm` 指向磁盘上的本地副本 —— 仅用于离线回归 /
+# 本地假上游实验；生产环境请用 https URL，否则 wasm 不会随上游更新。
 # wasm_url = "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm"
 
 # 代理配置（可选，绕过 CloudFront WAF 地区限制）

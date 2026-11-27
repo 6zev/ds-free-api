@@ -32,6 +32,8 @@ REAL_CHALLENGE = {
 }
 
 SESSIONS = {"n": 0}
+# 续写轮标记：`MOCK_THINK_ONLY_ONCE` 用它区分「首轮」和「续写轮」
+CONTINUED = {"n": False}
 RESPONSE_MSG_ID = {"n": 1000}
 
 
@@ -67,7 +69,27 @@ class Handler(BaseHTTPRequestHandler):
         # `MOCK_THINK_ONLY=1`：复现上游「THINK-only 短流」（3 帧后直接 EOF）。
         # 这是「零正文截断」的回归样本：客户端必须拿到 length / max_tokens /
         # incomplete，而不是 stop / end_turn / completed。
-        if os.environ.get("MOCK_THINK_ONLY") == "1":
+        think_only = os.environ.get("MOCK_THINK_ONLY") == "1"
+        if os.environ.get("MOCK_THINK_ONLY_ONCE") == "1" and CONTINUED["n"]:
+            think_only = False
+        # `MOCK_CLOSE_AUTO_RESUME=1`：只发 THINK + FINISHED，`event: close`
+        # 带 `{"auto_resume":true}`。复现「想了很久、上游说还要继续、然后断流」，
+        # 客户端必须无视 Complete 判定、再续一轮，并且**真的拿到**续写正文。
+        close_auto_resume = (
+            os.environ.get("MOCK_CLOSE_AUTO_RESUME") == "1" and not CONTINUED["n"]
+        )
+        if close_auto_resume:
+            frames = [
+                "event: ready\ndata: "
+                + json.dumps({"request_message_id": rid - 1, "response_message_id": rid})
+                + "\n\n",
+                'event: update_session\ndata: {"p":"response/status","o":"SET","v":"WIP"}\n\n',
+                'data: {"p":"response/fragments","o":"APPEND","v":[{"type":"THINK","content":"We"}]}\n\n',
+                'data: {"p":"response/status","o":"SET","v":"FINISHED"}\n\n',
+                'event: close\ndata: {"auto_resume":true}\n\n',
+            ]
+            return rid, "".join(frames).encode()
+        if think_only:
             frames = [
                 "event: ready\ndata: "
                 + json.dumps({"request_message_id": rid - 1, "response_message_id": rid})
@@ -152,6 +174,9 @@ class Handler(BaseHTTPRequestHandler):
             challenge["target_path"] = body.get("target_path", "/api/v0/chat/completion")
             return self._json(envelope({"challenge": challenge}))
         if path.endswith("/chat/completion"):
+            # 续写轮带 `parent_message_id`：`MOCK_THINK_ONLY_ONCE` 靠它区分首轮
+            if body.get("parent_message_id"):
+                CONTINUED["n"] = True
             rid, sse = self._sse_body()
             with open(LOG, "a") as f:
                 f.write(

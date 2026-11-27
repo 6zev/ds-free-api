@@ -255,6 +255,18 @@ impl Accounts {
         Ok(result.to_header())
     }
 
+    /// 用当前求解器解一次已有 challenge
+    pub(crate) fn solve_challenge(
+        &self,
+        challenge_data: &crate::accounts::pow::Challenge,
+    ) -> Result<String, CoreError> {
+        let solver = self
+            .solver
+            .try_read()
+            .map_err(|_| CoreError::ProviderError("PoW 求解器被占用".into()))?;
+        Ok(solver.solve(challenge_data)?.to_header())
+    }
+
     pub fn account_statuses(&self) -> Vec<AccountStatus> {
         self.pool.account_statuses()
     }

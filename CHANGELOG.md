@@ -4,6 +4,66 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.3] - 2026-11-27
+
+### 修复：`[ds_core.auto_resume]` 开启后请求永久挂起（续写 future 被 drop）
+
+- **根因**：`ResponseStream::poll_next` 在续写 future 返回 `Poll::Pending` 时执行了
+  `drop(fut)`。续写请求的 TCP 连接、前缀缓冲、waker 全部挂在那个 future 上，drop 即
+  中断；随后 `resume_polling = true` 让之后每一次 `poll_next` 都返回 `Pending` ——
+  客户端只看到连接不结束、上游一次 attempt 都没收到。
+- **改动**：`resume_fut: Option<Pin<Box<dyn Future<…>>>>` 持久保存在流上，`Pending`
+  时原样放回并**重复 poll 同一个 future**；只有 `Ready` 才消费。旧的两个前提错误的
+  单测（断言 Pending 后不再 poll）删除，替换为 `resume_future_resumes_after_pending`
+  （本地 `PendingThenReady` future，首次自唤醒、第二次返回结果）。
+
+### 修复：续写永远拿不到账号（`no available account`）
+
+- **根因**：续写回调从账号池重新领取账号，但本轮请求仍持有该账号的 `AccountGuard`
+  （状态 `Busy`），池里不可能再给第二个 —— 必然 `None` → `Overloaded`。即使能领到，
+  会话 `chat_session_id` 绑定在**原账号的设备身份**上，换账号只会返回「会话不存在」。
+- **改动**：`maybe_supervise()` 显式接收 `session_account: Arc<Account>`，随
+  `ReplierSeed` 传给 `resume_completion()`，续写走同一账号、同一设备身份。
+  账号**不写进** `ChatRequest`（公开数据模型不承载运行时句柄）。
+- 顺带把 8 个参数拆出 `ResumeParams { model_type, thinking_enabled, search_enabled }`，
+  移除 `#[allow(clippy::too_many_arguments)]`。
+
+### 修复：PoW challenge 请求缺风控令牌，续写与首轮 PoW 都可能被静默丢弃
+
+- **根因**：`create_pow_challenge` / `create_guest_pow_challenge` 只发裸
+  `auth_headers` / `client_headers`，不带 `x-hif-leim` / `x-hif-dliq`。真实客户端在
+  **每个**业务请求上附加风险令牌；缺失时该请求会被上游或中间层当异常流量丢弃。
+- **改动**：新增 `pow_challenge_headers(token: Option<&str>)` —— 鉴权（可选）+ HIF +
+  PoW 统一在这里组装，两个 challenge 端点共用。回归测试
+  `pow_challenge_carries_hif_headers` 用桩令牌验证头确实进入请求构造流程。
+
+### 修复：上游「无返回值」接口返回 `{}` 被当成反序列化失败
+
+- **根因**：`EnvelopeData.biz_data` 直接反序列化成 `T`。`stop_stream` / `delete_session`
+  实测返回 `biz_data: {}` 而非 `null`，`Option<()>` 于是报
+  `invalid type: map, expected unit` —— 正常停止被记成失败，会话清理报错。
+- **改动**：`biz_data` 先读成 `serde_json::Value`，空对象归一为 `Null` 后再交给 `serde`
+  转成 `T`；其它类型的错误语义不变。
+
+### 修复：截断收尾被 `cycle_flush` 抢先置 `Done`，`on_truncation` 长期不触发
+
+- **根因**：EOF 分支先 `cycle_flush` 冲刷残帧，而 `cycle_flush` 会把 `phase` 直接推成
+  `Done`，`start_resume` 的续写分支再也走不到。
+- **改动**：EOF 改用 `flush_frames_keep_open()`，收尾/续写判定统一交给 `start_resume`
+  （先看残帧里有没有正文，再按 `plan_resume` 决定）。`event: close` 的 `auto_resume`
+  信号提到流自身的 `close_auto_resume` 字段，避免被 `reset_for_resume` 清掉。
+  同时引入 `last_outcome` 记住上一轮冲刷结果，防止「续写结束后零分片」把整次回答
+  误判为截断。新增 `SessionHandle::drop_cache_only()`：截断续写前只把会话从复用缓存
+  中摘掉，不发 `stop_stream`（会话还要继续写）。
+
+### 其他
+
+- `get_wasm` 支持 `file:///abs/path.wasm`，供离线回归/本地假上游使用；生产仍应用
+  https URL（`config.example.toml` 已注明）。
+- 新增 `tests` 用辅助：`AccountGuard::busy_for_test`、`Account::offline_for_test`、
+  `DsClient::offline_for_test`、`Accounts::solve_challenge`、`DeviceTokens::get` 提升为
+  `pub(crate)`（均为 `#[cfg(test)]` 或库内可见性调整，不改变公开 API）。
+
 ## [0.6.2] - 2026-11-26
 
 ### 修复：`source = "input"` 被上游拒绝导致「能登录但无法对话」（HTTP 422）

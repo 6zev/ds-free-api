@@ -945,6 +945,35 @@ Responses stream   → event: response.incomplete  reason=max_output_tokens（�
 Responses non-stream → status=incomplete  incomplete_details.reason=max_output_tokens
 ```
 
+#### 截断续写（`[ds_core.auto_resume]`）的三个必查点
+
+`on_truncation = true` 时流层会自动续写。2026-11-27 排查「开了也从来不断言」时
+定位到三处**互相独立**的缺陷，任何一处没修好都会表现为「续写不生效」：
+
+1. **续写 future 必须持久保存**。`ResponseStream::poll_next` 第一次 poll 续写请求时
+   只是登记 waker，状态全在那个 future 里；旧实现在 `Pending` 分支直接 `drop(fut)`，
+   请求当场被中断，却把 `resume_polling` 置 `true`，之后每次 `poll_next` 都返回
+   `Pending` —— 客户端挂死，上游一次 attempt 都没收到。现在用
+   `resume_fut: Option<Pin<Box<dyn Future<…>>>>` 字段保存并**重复 poll 同一个 future**。
+2. **续写必须沿用本轮账号**。会话绑定在账号的设备身份上（`chat_session_id`），换账号
+   只会得到「会话不存在」；而本轮流正持有该账号的 `AccountGuard`（`Busy`），
+   从池里再取一次永远是 `None`。`maybe_supervise` 因此显式接收 `session_account`，
+   账号**不挂在** `ChatRequest` 上（那是对外公开的数据结构）。
+3. **PoW challenge 也要带风控令牌**。`create_pow_challenge` 早先只发裸 `auth_headers`，
+   缺 `x-hif-leim` / `x-hif-dliq` 的请求会被上游/代理静默丢弃，表现同样是「续写一直
+   pending」。现在统一走 `pow_challenge_headers()`。
+
+本地回归（`scripts/risk-experiment/mock_upstream.py`，零账号流量）：
+
+| 场景 | 环境变量 | 期望 |
+|------|----------|------|
+| 上游 `close` 带 `auto_resume` | `MOCK_CLOSE_AUTO_RESUME=1` | `stop` + 正文，`records=2` |
+| 首轮只思考、续写后正常 | `MOCK_THINK_ONLY=1 MOCK_THINK_ONLY_ONCE=1` | `stop` + 正文，`records=2` |
+| 一直只思考（耗尽上限） | `MOCK_THINK_ONLY=1` | `length`，续写恰好 `max_attempts` 次，`records=2` |
+
+> 本地 mock 的 `wasm_url` 用 `file:///abs/path/sha3.wasm`（`get_wasm` 支持该前缀），
+> 免去离线环境拉外网。生产请保持 https URL，否则 wasm 不会随上游版本更新。
+
 #### 本地假上游：`[proxy] bypass_hosts` 与加密登录体
 
 用 `api_base = "http://mock.lan:8098/api/v0"` 把真实二进制指向本地 mock 时有两个坑：

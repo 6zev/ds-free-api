@@ -18,7 +18,7 @@ use crate::CoreError;
 use crate::accounts::ClientError;
 use crate::accounts::{AccountGuard, DsClient, StopStreamPayload};
 
-use super::resume::{ResumeReplier, ResumedStream};
+use super::resume::ResumeReplier;
 
 // ── 精简响应协议 ──────────────────────────────────────────────────────
 
@@ -79,6 +79,13 @@ pub(crate) struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// 只把会话从复用缓存里摘掉（不发 stop_stream、不删上游会话）。
+    ///
+    /// 截断续写前用：会话本身还要继续写，但空回复不能留在缓存里被下一轮复用。
+    fn drop_cache_only(&self) {
+        self.sessions.lock().unwrap().remove(&self.session_id);
+    }
+
     fn cleanup(&self, finished: bool) {
         let start = Instant::now();
         self.sessions.lock().unwrap().remove(&self.session_id);
@@ -564,6 +571,8 @@ pin_project! {
     pub(crate) struct ResponseStream {
         #[pin]
         raw: Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>,
+        // 不 pin：drop 阶段 `PinnedDrop` 仍能拿到 `&mut` 字段，
+        // 且账号必须先于 `session` 释放（会话清理要读账号上缓存的会话）。
         _guard: AccountGuard,
         session: SessionHandle,
 
@@ -578,23 +587,36 @@ pin_project! {
         cycle_complete: bool,
         // 是否至少成功续写过一次
         resumed_any: bool,
-        // 已下发 INCOMPLETE 结束（续写条件之一）
-        resume_incomplete: bool,
+        // 上一轮冲刷出来的 outcome：续写结束后是 `Truncated`，命中时下一轮
+        // `cycle_flush` 会用「零分片」把整次回答误判成截断
+        last_outcome: StreamOutcome,
         // 纯 thinking 静默期的保活心跳（配置为 0 时不创建）
         heartbeat: Option<tokio::time::Interval>,
         // 流结束后由 supervisor 读取的收尾判定
         outcome: StreamOutcome,
         // 截断续写回调（None = 未启用自动续写）
         replier: Option<ResumeReplier>,
-        // 进行中的续写请求
-        #[pin]
-        resume_fut: Option<Pin<Box<dyn Future<Output = Result<ResumedStream, CoreError>> + Send>>>,
         // 已尝试续写次数
         resume_attempts: u32,
+        // 正在等待的续写 future。**必须持久保存**：future 自己在第一次 poll 时
+        // 登记 waker，之后只剩这个句柄持有续写请求的状态（TCP 连接、前缀缓冲）。
+        // 早先的实现在 `Pending` 分支直接 `drop`，续写请求被立刻中断——翘尾表现为
+        // 「续写: 计算 PoW 之后什么都没有、上游一次 attempt 也没收到」。
+        resume_fut: Option<
+            Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<super::resume::ResumedStream, CoreError>,
+                        > + Send,
+                >,
+            >,
+        >,
         // 续写次数上限（0 = 不续写）
         resume_cap: u32,
         // 续写时使用空 prompt
         auto_resume_empty_prompt: bool,
+        // 本轮是否观察到上游 `event: close` 的 `auto_resume`（续写后重置）
+        close_auto_resume: bool,
     }
 
     impl PinnedDrop for ResponseStream {
@@ -628,17 +650,18 @@ impl ResponseStream {
             finished: false,
             cycle_complete: false,
             resumed_any: false,
-            resume_incomplete: false,
+            last_outcome: StreamOutcome::Complete,
             heartbeat,
             // 尚未结束：初始值必须是 Truncated。用 Complete 作初始值会让
             // 「WIP 之后直接断流」在 `classify_outcome` 之前就被当成正常结束
             // （settle_on_finish 只降级 Complete，无法从 Complete 反映空正文）。
             outcome: StreamOutcome::Truncated,
             replier: None,
-            resume_fut: None,
             resume_attempts: 0,
+            resume_fut: None,
             resume_cap: 0,
             auto_resume_empty_prompt: true,
+            close_auto_resume: false,
         }
     }
 
@@ -672,8 +695,8 @@ fn settle_on_finish(patch_state: &PatchState, outcome: &mut StreamOutcome) {
 impl Stream for ResponseStream {
     type Item = Result<StreamEvent, CoreError>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.as_mut().project();
 
         // 首个事件始终是 Meta（续写轮次由内层流各自重新下发）
         if !*this.meta_sent {
@@ -692,11 +715,25 @@ impl Stream for ResponseStream {
             return Poll::Ready(None);
         }
 
+        // 正在等续写 future：继续 poll **同一个** future（绝不重建），
+        // 这样 waker 与请求状态都留在原位。
+        if this.resume_fut.is_some() {
+            let mut fut = this.resume_fut.take().expect("resume future 刚判定存在");
+            let polled = fut.as_mut().poll(cx);
+            // 投影只在读字段期间存在；上面 `this` 已经用完，可直接再整借。
+            return finish_resume_poll(&mut self, cx, polled, fut);
+        }
+
         loop {
             if let Some(frame) = take_frame(this.buf) {
                 let events = match this.patch_state.apply_frame(frame_str(&frame).as_ref()) {
                     Ok(evts) => evts,
-                    Err(e) => return Poll::Ready(Some(Err(e))),
+                    // 帧解析失败时仍必须先落收尾：否则 `outcome` 停在初始值，
+                    // 续写判定与 `finish_reason` 全部失真。
+                    Err(e) => {
+                        cycle_flush(this.buf, this.patch_state, this.phase, this.outcome);
+                        return Poll::Ready(Some(Err(e)));
+                    }
                 };
 
                 if events.is_empty() {
@@ -705,11 +742,7 @@ impl Stream for ResponseStream {
 
                 // 过滤：阶段切换信号插入 + 延后排队
                 let mut filtered = VecDeque::new();
-                if finalize_events(this.patch_state, this.phase, events, &mut filtered)
-                    == Some(true)
-                {
-                    *this.resume_incomplete = true;
-                }
+                finalize_events(this.patch_state, this.phase, events, &mut filtered);
 
                 // 第一个事件立即返回（移动而非克隆），其余入 pending
                 if let Some(first) = filtered.pop_front() {
@@ -726,120 +759,32 @@ impl Stream for ResponseStream {
                     return Poll::Ready(Some(Err(CoreError::Stream(e.to_string()))));
                 }
                 Poll::Ready(None) => {
-                    // 一轮上游流结束：先冲刷残留帧（最后一帧可能不带空行）
-                    let mut flushed = cycle_flush(
+                    // 一轮上游流结束：先冲刷残帧（最后一帧可能不带空行），
+                    // 但**不能**在这里收尾 —— `cycle_flush` 会把 `phase` 直接置成
+                    // `Done`，`start_resume` 的续写分支就又走不到了（这正是
+                    // `on_truncation` 长期失效的原因）。收尾/续写的判定统一交给
+                    // `start_resume`：它先看残帧里有没有正文，再按 `plan_resume` 决定。
+                    // 同时带走本轮的 `event: close` 信号：`PatchState` 会被
+                    // `reset_for_resume` 清空，标记必须提到流自身的字段上。
+                    let mut residual = flush_frames_keep_open(
                         this.buf,
                         this.patch_state,
                         this.phase,
-                        this.resume_incomplete,
                         this.outcome,
                     );
-                    if let Some(first) = flushed.pop_front() {
-                        this.pending.extend(flushed);
+                    if this.patch_state.auto_resume {
+                        *this.close_auto_resume = true;
+                        this.patch_state.reset_for_resume();
+                    }
+                    if let Some(first) = this.pending.pop_front() {
+                        this.pending.extend(residual);
                         return Poll::Ready(Some(Ok(first)));
                     }
-                    // 判定是否续写
-                    let plan = super::resume::plan_resume(
-                        *this.resume_cap,
-                        *this.resume_attempts,
-                        *this.outcome,
-                    );
-                    if !plan.resume {
-                        settle_on_finish(this.patch_state, this.outcome);
-                        // finalize_events / cycle_flush 可能已经把 phase 推到 Done，
-                        // 所以「结束前是否已产出正文」要在这里先留住。
-                        let produced_content =
-                            this.patch_state.response_has_content || *this.phase == Phase::Content;
-                        this.session.cleanup(!this.patch_state.response_has_content);
-                        *this.phase = Phase::Done;
-                        *this.finished = true;
-                        // 空正文永远按截断上报（`length`）：`finish_reason_after_resume`
-                        // 只看 outcome，而 FINISHED+空正文在关闭续写时仍是 Complete。
-                        let finish = if produced_content {
-                            super::resume::finish_reason_after_resume(
-                                *this.outcome,
-                                *this.resumed_any,
-                            )
-                            .to_owned()
-                        } else {
-                            "length".to_owned()
-                        };
-                        return Poll::Ready(Some(Ok(StreamEvent::Done {
-                            finish_reason: Some(finish),
-                            accumulated_token_usage: None,
-                        })));
+                    if let Some(first) = residual.pop_front() {
+                        this.pending.extend(residual);
+                        return Poll::Ready(Some(Ok(first)));
                     }
-
-                    // 起一次续写（上限计数在流侧，单次 replier 用完即弃）
-                    let Some(replier) = this.replier.as_mut() else {
-                        *this.phase = Phase::Done;
-                        *this.finished = true;
-                        this.session.cleanup(!this.patch_state.response_has_content);
-                        return Poll::Ready(None);
-                    };
-                    // 空回复不留会话：复用它只会把同一个 parent 反复续成空
-                    if !this.patch_state.response_has_content {
-                        this.session.cleanup(false);
-                    }
-                    *this.resume_attempts += 1;
-                    let ticket = super::resume::ResumeTicket {
-                        session_id: this.session.session_id.clone(),
-                        parent_message_id: this.session.message_id,
-                        prompt: super::resume::resume_prompt(*this.auto_resume_empty_prompt),
-                        request_id: String::new(),
-                    };
-                    log::info!(
-                        target: "ds_core::accounts",
-                        "auto_resume: attempt={}/{}, session={}",
-                        *this.resume_attempts,
-                        *this.resume_cap,
-                        ticket.session_id
-                    );
-                    *this.resume_fut = Some(replier(ticket));
-
-                    // 同步推进一次续写请求，可能立即 Ready
-                    let ready = this
-                        .resume_fut
-                        .as_mut()
-                        .as_pin_mut()
-                        .map(|fut| fut.poll(cx));
-                    match ready {
-                        None | Some(Poll::Pending) => return Poll::Pending,
-                        Some(Poll::Ready(Ok(resumed))) => {
-                            this.resume_fut.set(None);
-                            *this.raw = resumed.raw;
-                            this.buf.clear();
-                            this.patch_state.reset_for_resume();
-                            this.session.message_id = resumed.message_id;
-                            *this.phase = Phase::Init;
-                            *this.finished = false;
-                            *this.cycle_complete = false;
-                            *this.resume_incomplete = false;
-                            if let Some(iv) = this.heartbeat.as_mut() {
-                                iv.reset();
-                            }
-                            *this.resumed_any = true;
-                            continue;
-                        }
-                        Some(Poll::Ready(Err(e))) => {
-                            log::warn!(
-                                target: "ds_core::accounts",
-                                "auto_resume failed: {e}"
-                            );
-                            *this.phase = Phase::Done;
-                            *this.finished = true;
-                            this.session.cleanup(true);
-                            let finish = super::resume::finish_reason_after_resume(
-                                *this.outcome,
-                                *this.resumed_any,
-                            )
-                            .to_owned();
-                            return Poll::Ready(Some(Ok(StreamEvent::Done {
-                                finish_reason: Some(finish),
-                                accumulated_token_usage: None,
-                            })));
-                        }
-                    }
+                    return start_resume(&mut self, cx);
                 }
                 Poll::Pending => {
                     // 纯 thinking 静默期：上游暂时没有字节，但思考还没结束。
@@ -858,14 +803,15 @@ impl Stream for ResponseStream {
     }
 }
 
-// ── 截断续写调度 ─────────────────────────────────────────────────────
+// ── 收尾与续写判定 ───────────────────────────────────────────────────
 
-/// 冲刷缓冲区剩余帧并收尾一轮（含收尾判定与告警）
-fn cycle_flush(
+/// 冲刷残帧但**不**收尾：把 `cycle_flush` 会下发的 Done 先按正文判定回退，
+/// 让调用方（`start_resume`）拿到真实的 `status` / `response_has_content` 再决定
+/// 「续写」还是「收尾」。
+fn flush_frames_keep_open(
     buf: &mut BytesMut,
     patch_state: &mut PatchState,
     phase: &mut Phase,
-    resume_incomplete: &mut bool,
     outcome: &mut StreamOutcome,
 ) -> VecDeque<StreamEvent> {
     let mut flushed = VecDeque::new();
@@ -880,16 +826,252 @@ fn cycle_flush(
         let Ok(events) = patch_state.apply_frame(frame_str(&frame).as_ref()) else {
             break;
         };
-        if finalize_events(patch_state, phase, events, &mut flushed) == Some(true) {
-            *resume_incomplete = true;
+        finalize_events(patch_state, phase, events, &mut flushed);
+    }
+    if patch_state.status.is_some() {
+        *outcome = classify_outcome(patch_state);
+    }
+    flushed
+}
+
+/// 按 `plan_resume` 决定续写或收尾（就地接受已投影字段）。
+///
+/// 续写成功后直接替换内层流并从新流继续解析；`Poll::Pending` 原样上传
+/// （waker 已注册在续写 future 或新的上游流上）。
+fn start_resume(
+    this: &mut Pin<&mut ResponseStream>,
+    cx: &mut Context<'_>,
+) -> Poll<Option<Result<StreamEvent, CoreError>>> {
+    let projected = this.as_mut().project();
+    let plan = super::resume::plan_resume(
+        *projected.resume_cap,
+        *projected.resume_attempts,
+        *projected.outcome,
+    );
+    // 上游 `event: close` 带 `auto_resume=true` 时，即使本轮判定是 Complete
+    // （长时间思考后上游主动断开，状态仍是 FINISHED）也必须再续一轮 ——
+    // 这正是「思考很久然后没有下文」的那条路径。
+    // 这里只看不改：`replier` 没装（续写被关闭）时下面会走收尾分支，若先把
+    // 信号清掉，下一次 `poll_next` 就再也拿不到它了。
+    let upstream_wants_more = *projected.close_auto_resume;
+    let plan = if upstream_wants_more && *projected.resume_attempts < *projected.resume_cap {
+        log::info!(
+            target: "ds_core::accounts",
+            "auto_resume: 上游 close 要求继续生成 (outcome={:?}), 追加一次续写",
+            *projected.outcome
+        );
+        super::resume::ResumePlan {
+            resume: true,
+            attempt: *projected.resume_attempts,
+        }
+    } else {
+        plan
+    };
+    log::debug!(
+        target: "ds_core::accounts",
+        "auto_resume 判定: cap={}, attempts={}, outcome={:?}, plan.resume={}",
+        *projected.resume_cap,
+        *projected.resume_attempts,
+        *projected.outcome,
+        plan.resume
+    );
+    // 先把 `replier` 取出来：它是唯一「还能不能续写」的判据
+    let replier = projected.replier.take();
+    let Some(mut replier) = replier.filter(|_| plan.resume) else {
+        // 这一轮没走续写，但残帧里可能还有最后一帧正文：补冲一次，
+        // 否则「WIP 断流」那一帧的整段回答会被静默丢掉。
+        let _residual = flush_frames_keep_open(
+            projected.buf,
+            projected.patch_state,
+            projected.phase,
+            projected.outcome,
+        );
+        let produced_content =
+            projected.patch_state.response_has_content || *projected.phase == Phase::Content;
+        settle_on_finish(projected.patch_state, projected.outcome);
+        projected
+            .session
+            .cleanup(!projected.patch_state.response_has_content);
+        *projected.phase = Phase::Done;
+        // 空正文永远按截断上报（`length`）：`finish_reason_after_resume`
+        // 只看 outcome，而 FINISHED+空正文在关闭续写时仍是 Complete。
+        let finish = if produced_content {
+            super::resume::finish_reason_after_resume(*projected.outcome, *projected.resumed_any)
+                .to_owned()
+        } else {
+            "length".to_owned()
+        };
+        return Poll::Ready(Some(Ok(StreamEvent::Done {
+            finish_reason: Some(finish),
+            accumulated_token_usage: None,
+        })));
+    };
+    // 空回复不留会话：复用它只会把同一个 parent 反复续成空。
+    // 只摘掉**缓存**，会话本身还要继续写，卸载上游由 idle 回收负责。
+    if !projected.patch_state.response_has_content {
+        projected.session.drop_cache_only();
+    }
+    let ticket = super::resume::ResumeTicket {
+        session_id: projected.session.session_id.clone(),
+        parent_message_id: projected.session.message_id,
+        prompt: super::resume::resume_prompt(*projected.auto_resume_empty_prompt),
+        request_id: String::new(),
+    };
+    // 上游可能其实已经把内容吐完（续写前的残帧里有 RESPONSE 分片）：
+    // 先冲刷残帧拿到真实判定，有正文就直接收尾，不再多打一次上游。
+    let residual = flush_frames_keep_open(
+        projected.buf,
+        projected.patch_state,
+        projected.phase,
+        projected.outcome,
+    );
+    if projected.patch_state.response_has_content {
+        log::debug!(
+            target: "ds_core::accounts",
+            "auto_resume: 残帧中已有 RESPONSE 内容，跳过续写 (status={:?})",
+            projected.patch_state.status
+        );
+        projected.session.cleanup(false);
+        *projected.phase = Phase::Done;
+        let finish =
+            super::resume::finish_reason_after_resume(*projected.outcome, false).to_owned();
+        projected.pending.extend(residual);
+        return Poll::Ready(Some(Ok(StreamEvent::Done {
+            finish_reason: Some(finish),
+            accumulated_token_usage: projected.patch_state.accumulated_token_usage,
+        })));
+    }
+
+    log::info!(
+        target: "ds_core::accounts",
+        "auto_resume: attempt={}/{}, session={}",
+        *projected.resume_attempts,
+        *projected.resume_cap,
+        ticket.session_id
+    );
+    *projected.resume_attempts += 1;
+    // 信号已消费：续写轮次必须重新观察 `event: close`，不能沿用上一轮。
+    *projected.close_auto_resume = false;
+    // 投影必须在这里自然失效：`finish_resume_poll` 要重新借用 `self`
+    let mut fut = replier(ticket);
+    let polled = fut.as_mut().poll(cx);
+    finish_resume_poll(this, cx, polled, fut)
+}
+
+/// 续写 future 的 poll 结果收尾：成功后替换内层流并递归续读，失败则收尾。
+///
+/// `Pending` 时 future 必须**存回 `resume_fut`**：它持有续写请求的全部状态
+/// （连接、已读前缀、waker）。丢掉它等于中止请求——这正是「续写永远 pending」
+/// 的根因。下次 `poll_next` 会取出**同一个** future 继续 poll，不会重建。
+fn finish_resume_poll(
+    this: &mut Pin<&mut ResponseStream>,
+    cx: &mut Context<'_>,
+    polled: Poll<Result<super::resume::ResumedStream, CoreError>>,
+    fut: Pin<
+        Box<
+            dyn std::future::Future<Output = Result<super::resume::ResumedStream, CoreError>>
+                + Send,
+        >,
+    >,
+) -> Poll<Option<Result<StreamEvent, CoreError>>> {
+    let mut projected = this.as_mut().project();
+    let step = match polled {
+        Poll::Ready(Ok(resumed)) => Ok(resumed),
+        Poll::Ready(Err(e)) => Err(e),
+        Poll::Pending => {
+            log::debug!(target: "ds_core::accounts", "auto_resume: 续写请求 pending");
+            *projected.resume_fut = Some(fut);
+            return Poll::Pending;
+        }
+    };
+    match step {
+        Err(e) => {
+            log::warn!(target: "ds_core::accounts", "auto_resume failed: {e:?}");
+            *projected.phase = Phase::Done;
+            projected.session.cleanup(true);
+            // 续写本身失败：即便此前有正文，整次回答也不完整
+            let finish = super::resume::finish_reason_after_resume(StreamOutcome::Truncated, false)
+                .to_owned();
+            Poll::Ready(Some(Ok(StreamEvent::Done {
+                finish_reason: Some(finish),
+                accumulated_token_usage: None,
+            })))
+        }
+        Ok(resumed) => {
+            log::info!(
+                target: "ds_core::accounts",
+                "auto_resume: 续写流已就绪, message_id={}",
+                resumed.message_id
+            );
+            *projected.raw = resumed.raw;
+            projected.buf.clear();
+            projected.patch_state.reset_for_resume();
+            *projected.last_outcome = *projected.outcome;
+            *projected.outcome = StreamOutcome::Complete;
+            projected.session.message_id = resumed.message_id;
+            *projected.phase = Phase::Init;
+            *projected.finished = false;
+            *projected.cycle_complete = false;
+            if let Some(iv) = projected.heartbeat.as_mut() {
+                iv.reset();
+            }
+            *projected.resumed_any = true;
+            // 续写已经完成：等待标记必须复位，否则新流的 `poll_next` 会在
+            // 入口处被短路成永久 `Pending`。
+            // 新流已就位：从新流继续解析（同一个唤醒内完成，不多等一轮）。
+            // `this` 在 `finish_resume_poll` 里只被借给投影，返回时已经释放，
+            // 这里可以直接再借。
+            this.as_mut().poll_next(cx)
         }
     }
-    if *phase != Phase::Done
-        && finalize_events(patch_state, phase, Vec::new(), &mut flushed) == Some(true)
-    {
-        *resume_incomplete = true;
+}
+
+// ── 截断续写调度 ─────────────────────────────────────────────────────
+
+/// 冲刷缓冲区剩余帧并收尾一轮（含收尾判定与告警）
+fn cycle_flush(
+    buf: &mut BytesMut,
+    patch_state: &mut PatchState,
+    phase: &mut Phase,
+    outcome: &mut StreamOutcome,
+) -> VecDeque<StreamEvent> {
+    let mut flushed = VecDeque::new();
+    loop {
+        let frame = if let Some(f) = take_frame(buf) {
+            f
+        } else if buf.is_empty() {
+            break;
+        } else {
+            buf.split()
+        };
+        let Ok(events) = patch_state.apply_frame(frame_str(&frame).as_ref()) else {
+            break;
+        };
+        finalize_events(patch_state, phase, events, &mut flushed);
     }
-    *outcome = classify_outcome(patch_state);
+    // 收尾判定只看 `status` 与「是否已有 RESPONSE 分片」：`WIP` 断流同样必须
+    // 落到 Done，否则最后一个事件永远不发，续写也判不出来。
+    // 不能靠 `finalize_events` —— 它只认终态 status，WIP 断流要自己补 Done。
+    {
+        *phase = Phase::Done;
+        let finish = patch_state.response_has_content.then(|| "stop".to_string());
+        if !patch_state.response_has_content {
+            log::warn!(
+                target: "ds_core::accounts",
+                "一轮上游流已结束但无 RESPONSE 内容: status={:?}，按截断上报 finish_reason=length",
+                patch_state.status
+            );
+        }
+        flushed.push_back(StreamEvent::Done {
+            finish_reason: finish,
+            accumulated_token_usage: patch_state.accumulated_token_usage,
+        });
+    }
+    // status 为空 = 本轮一帧都没收到（续写刚接上就被 flush 的空轮），
+    // 此时沿用上一轮的 outcome，不能把整次回答误判成截断。
+    if patch_state.status.is_some() {
+        *outcome = classify_outcome(patch_state);
+    }
     if *outcome == StreamOutcome::Truncated && !patch_state.response_has_content {
         log::warn!(
             target: "ds_core::accounts",
@@ -942,14 +1124,13 @@ fn finalize_events(
     phase: &mut Phase,
     events: Vec<StreamEvent>,
     out: &mut VecDeque<StreamEvent>,
-) -> Option<bool> {
+) {
     // 本帧新产生的内容也算「有正文」：`finalize_events` 只看事件流，
     // 不能依赖 `PatchState.response_has_content` 已经在别处被写过。
     let has_content = patch_state.response_has_content
         || events
             .iter()
             .any(|e| matches!(e, StreamEvent::ContentDelta { .. }));
-    let mut incomplete = None;
     for evt in events {
         match &evt {
             StreamEvent::ThinkDelta { .. } if *phase == Phase::Init || *phase == Phase::Content => {
@@ -967,10 +1148,12 @@ fn finalize_events(
         out.push_back(evt);
     }
 
+    // `WIP` 只是「还在写」：纯 thinking 阶段上游就发 WIP，若把它当收尾，
+    // 一轮还在跑就会被提前判成 Done，`auto_resume` 永远不来。
     let terminal_status = patch_state
         .status
         .as_deref()
-        .filter(|s| matches!(*s, "FINISHED" | "INCOMPLETE" | "WIP"))
+        .filter(|s| matches!(*s, "FINISHED" | "INCOMPLETE"))
         .filter(|_| *phase != Phase::Done)
         .map(str::to_string);
     if let Some(status) = terminal_status {
@@ -979,11 +1162,9 @@ fn finalize_events(
         // FINISHED，若照 status 判成 Complete，会话会留在账号上被复用，下一轮
         // 继续拿到空回复，客户端也看不到「没说完」。
         // INCOMPLETE 是上游的「先这样」结束：同样上报 length，是否续写交给 supervisor。
-        let is_incomplete = !has_content;
         let finish = has_content.then(|| "stop".to_string());
-        incomplete = Some(is_incomplete);
         let usage = patch_state.accumulated_token_usage;
-        if is_incomplete && !patch_state.response_has_content {
+        if !has_content && !patch_state.response_has_content {
             log::warn!(
                 target: "ds_core::accounts",
                 "状态机已结束但无 RESPONSE 内容: status={status}，按截断上报 finish_reason=length"
@@ -994,7 +1175,6 @@ fn finalize_events(
             accumulated_token_usage: usage,
         });
     }
-    incomplete
 }
 
 /// 判定上游流结束的收尾类型（供上层 supervisor 决定是否自动续写）
@@ -1009,6 +1189,8 @@ fn classify_outcome(state: &PatchState) -> StreamOutcome {
         Some("FINISHED") if !state.response_has_content => StreamOutcome::Truncated,
         Some("FINISHED") => StreamOutcome::Complete,
         Some("INCOMPLETE") => StreamOutcome::Incomplete,
+        // `WIP` 断流同样是半截回答（上游明确标了「还在写」），
+        // 与「一帧都没收到」一样落到 Truncated。
         _ => StreamOutcome::Truncated,
     }
 }
@@ -1188,6 +1370,8 @@ pub(crate) async fn wait_close(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     /// 回归：上游只镜像一帧 THINK 就带上 `WIP` 断流（真实上游偶发，见
@@ -1202,17 +1386,17 @@ mod tests {
         let events = state.apply_frame(frame).expect("帧应可解析");
         finalize_events(&mut state, &mut phase, events, &mut out);
 
-        let done = out
-            .iter()
-            .find_map(|e| match e {
-                StreamEvent::Done { finish_reason, .. } => Some(finish_reason.clone()),
-                _ => None,
-            })
-            .expect("WIP 终态应已追加 Done");
-        assert_eq!(done, None, "零 RESPONSE 分片时不得声称 stop");
+        // WIP 表示「还在写」：单帧不得收尾，否则一轮在跑就被判成 Done，
+        // `auto_resume` 再也等不到续写判定。
+        assert!(
+            out.iter().all(|e| !matches!(e, StreamEvent::Done { .. })),
+            "WIP 不是终态，不得提前下发 Done"
+        );
+        assert_eq!(phase, Phase::Thinking);
+        assert!(matches!(out.back(), Some(StreamEvent::ThinkDelta { .. })));
     }
 
-    /// 回归：`cycle_flush` 在 WIP 断流后把 outcome 判为 Truncated，
+    /// 回归：`cycle_flush` 在 WIP 断流后补发收尾（零 RESPONSE ⇒ length），
     /// 且不能因为「有 THINK 内容」就漏掉续写判定。
     #[test]
     fn think_only_wip_stream_is_truncated() {
@@ -1226,18 +1410,12 @@ mod tests {
             .as_bytes(),
         );
         let mut phase = Phase::Init;
-        let mut resume_incomplete = false;
-        let mut outcome = StreamOutcome::Truncated;
-        let flushed = cycle_flush(
-            &mut buf,
-            &mut state,
-            &mut phase,
-            &mut resume_incomplete,
-            &mut outcome,
-        );
+        let mut outcome = StreamOutcome::Complete;
+        let flushed = cycle_flush(&mut buf, &mut state, &mut phase, &mut outcome);
         assert_eq!(outcome, StreamOutcome::Truncated);
         assert!(!state.response_has_content);
-        // WIP 断流在 `cycle_flush` 里就已收尾：Done 必须已经排队且不带 stop。
+        // WIP 断流在 `cycle_flush` 里补发收尾：零 RESPONSE ⇒ 由 `start_resume`
+        // 统一改写为 `length`，这里只要求补上了一个 Done 占位。
         assert!(matches!(
             flushed.back(),
             Some(StreamEvent::Done {
@@ -1466,5 +1644,150 @@ mod tests {
         ).unwrap();
         assert_eq!(content_text(&events), "x");
         assert_eq!(state.fragments.len(), 1);
+    }
+
+    /// 回归：续写 future 返回 `Pending` 后必须**被保存并继续 poll**。
+    ///
+    /// 真正的伤害是丢弃句柄：`Pending` 之后 future 已中止，续写请求再也
+    /// 等不到结果（表现为「续写永远 pending、上游一次 attempt 也没收到」）。
+    /// 这里用一个「第一次 Pending、被 waker 叫醒后返回 Ready」的 future 复现：
+    /// 丢弃句柄的实现在唤醒后再也拿不到结果。
+    #[tokio::test]
+    async fn resume_future_resumes_after_pending() {
+        use std::sync::Mutex;
+        use std::task::Waker;
+
+        struct PendingThenReady {
+            first: Option<Waker>,
+            polled: usize,
+            fired: Arc<Mutex<bool>>,
+        }
+        impl std::future::Future for PendingThenReady {
+            type Output = Result<super::super::resume::ResumedStream, CoreError>;
+            fn poll(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Self::Output> {
+                self.polled += 1;
+                // 第一次登记 waker 后立刻把它叫醒：下一次 poll 就能拿到结果。
+                self.first
+                    .get_or_insert_with(|| cx.waker().clone())
+                    .wake_by_ref();
+                let ready = *self.fired.lock().unwrap();
+                if ready {
+                    Poll::Ready(Err(CoreError::Stream("续写测试结束".into())))
+                } else {
+                    *self.fired.lock().unwrap() = true;
+                    Poll::Pending
+                }
+            }
+        }
+
+        let raw = futures::stream::iter([Ok(bytes::Bytes::from_static(b"data: {}\n\n"))]);
+        let mut stream = ResponseStream::new(
+            Box::pin(raw),
+            AccountGuard::busy_for_test(Arc::new(crate::accounts::Account::offline_for_test())),
+            dummy_session(),
+            "acc".to_owned(),
+            0,
+        );
+        let fired = Arc::new(Mutex::new(false));
+        let seen = fired.clone();
+        stream.install_resume(
+            Box::new(move |_ticket| {
+                Box::pin(PendingThenReady {
+                    first: None,
+                    polled: 0,
+                    fired: seen.clone(),
+                })
+            }),
+            2,
+            true,
+        );
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        // 第一次拿到帧；第二次 EOF 进入续写判定（future Pending 并自唤醒）；
+        // 第三次必须重新 poll 同一个 future 并拿到 Ready(Err) —— 走失败收尾。
+        let mut done = None;
+        for _ in 0..6 {
+            if let Poll::Ready(Some(Ok(StreamEvent::Done { finish_reason, .. }))) =
+                stream.poll_next_unpin(&mut cx)
+            {
+                done = finish_reason;
+                break;
+            }
+        }
+        assert!(*fired.lock().unwrap(), "续写 future 没有被重新 poll");
+        assert_eq!(done.as_deref(), Some("length"), "续写失败必须按截断收尾");
+    }
+
+    /// 回归：`event: close` 带 `{"auto_resume":true}` 时，即便本轮已判
+    /// `Complete`（长时间思考后上游主动断流，status 仍是 FINISHED），也必须
+    /// 再续一轮 —— 这就是「想了很久然后没有下文」的路径。
+    #[tokio::test]
+    async fn close_auto_resume_forces_resume_on_complete() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let raw = futures::stream::iter([Ok(bytes::Bytes::from_static(
+            b"data: {\"p\":\"response/fragments\",\"o\":\"SET\",\"v\":[{\"type\":\"RESPONSE\",\"content\":\"a\"}]}\n\n              data: {\"p\":\"response/status\",\"o\":\"SET\",\"v\":\"FINISHED\"}\n\n              event: close\ndata: {\"auto_resume\":true}\n\n",
+        ))]);
+        let mut stream = ResponseStream::new(
+            Box::pin(raw),
+            AccountGuard::busy_for_test(Arc::new(crate::accounts::Account::offline_for_test())),
+            dummy_session(),
+            "acc".to_owned(),
+            0,
+        );
+        stream.install_resume(
+            Box::new(move |_ticket| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                // 永远 Ready，让续写立刻完成，测试无需额外唤醒
+                Box::pin(futures::future::ready(Err(CoreError::Stream(
+                    "测试用续写失败".to_owned(),
+                ))))
+            }),
+            2,
+            true,
+        );
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut events = Vec::new();
+        for _ in 0..40 {
+            match stream.poll_next_unpin(&mut cx) {
+                Poll::Ready(Some(Ok(evt))) => events.push(evt),
+                Poll::Ready(Some(Err(e))) => panic!("意外的流错误: {e:?}"),
+                Poll::Ready(None) => break,
+                Poll::Pending => {}
+            }
+        }
+
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "上游 close 声明 auto_resume=true，但本轮已判 Complete 时没有续写"
+        );
+        let done = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                StreamEvent::Done { finish_reason, .. } => Some(finish_reason.clone()),
+                _ => None,
+            })
+            .expect("流必须有 Done 事件");
+        assert_eq!(done.as_deref(), Some("length"), "续写失败应报 length");
+    }
+
+    fn dummy_session() -> SessionHandle {
+        SessionHandle {
+            client: crate::accounts::DsClient::offline_for_test(),
+            token: String::new(),
+            session_id: "s".to_owned(),
+            message_id: 0,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            account: None,
+            chain: Vec::new(),
+            keep_on_finish: false,
+        }
     }
 }

@@ -137,7 +137,7 @@ pub struct FilePayload {
 }
 
 /// 对话请求
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ChatRequest {
     /// 完整 prompt（新建会话时发送；含角色标签与历史）
     pub prompt: String,
@@ -153,6 +153,20 @@ pub struct ChatRequest {
     pub delta: Option<DeltaPrompt>,
     /// 保留字段：自动续写由流内部调度，外部调用方保持 `None`
     pub resume: Option<()>,
+}
+
+impl std::fmt::Debug for ChatRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatRequest")
+            .field("prompt_len", &self.prompt.len())
+            .field("thinking_enabled", &self.thinking_enabled)
+            .field("search_enabled", &self.search_enabled)
+            .field("model_type", &self.model_type)
+            .field("files", &self.files.len())
+            .field("delta", &self.delta)
+            .field("resume", &self.resume)
+            .finish_non_exhaustive()
+    }
 }
 
 /// 增量 prompt：会话复用时只发新增内容
@@ -237,19 +251,30 @@ impl Chat {
         mut inner: ResponseStream,
         req: &ChatRequest,
         request_id: &str,
+        session_account: Arc<crate::accounts::Account>,
     ) -> ResponseStream {
         let auto_resume = self.auto_resume.read().expect("auto_resume 锁中毒").clone();
+        log::debug!(
+            target: "ds_core::accounts",
+            "req={} auto_resume 配置: on_truncation={}, max_attempts={}, thinking_heartbeat_secs={}, is_resume_req={}",
+            request_id,
+            auto_resume.on_truncation,
+            auto_resume.max_attempts,
+            auto_resume.thinking_heartbeat_secs,
+            req.resume.is_some()
+        );
         if !auto_resume.on_truncation || auto_resume.max_attempts == 0 || req.resume.is_some() {
             return inner;
         }
-        // replier 需要持有状态（账号池 + 原请求），用 Arc<Mutex> 共享给闭包
-        let shared: SharedReplier = Arc::new(Mutex::new(Some((
-            self.accounts.clone(),
-            req.clone(),
-            request_id.to_string(),
-            auto_resume.empty_prompt,
-        ))));
-        let replier = build_replier(shared);
+        // replier 需要持有状态（账号池 + 原请求 + 本轮账号）
+        let seed = ReplierSeed {
+            accounts: self.accounts.clone(),
+            req: req.clone(),
+            request_id: request_id.to_string(),
+            empty_prompt: auto_resume.empty_prompt,
+            session_account,
+        };
+        let replier = build_replier(Arc::new(Mutex::new(Some(seed))));
         inner.install_resume(replier, auto_resume.max_attempts, auto_resume.empty_prompt);
         inner
     }
@@ -591,7 +616,7 @@ impl Chat {
                 session_id,
                 message_id: stop_id,
                 sessions: self.active_sessions.clone(),
-                account: Some(account),
+                account: Some(account.clone()),
                 keep_on_finish: self.session_reuse,
                 // 分块路径不参与增量复用（见上面的 acquire_session(None)）
                 chain: Vec::new(),
@@ -602,7 +627,7 @@ impl Chat {
                 .expect("auto_resume 锁中毒")
                 .thinking_heartbeat_secs,
         );
-        let inner = self.maybe_supervise(inner, req, request_id);
+        let inner = self.maybe_supervise(inner, req, request_id, account);
         let stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, CoreError>> + Send>> =
             Box::pin(inner);
         Ok(ChatResponse { stream })
@@ -890,6 +915,10 @@ impl Chat {
             g.disarm();
         }
 
+        // 续写要沿用本轮账号：该账号正被当前流占用（`AccountGuard` busy），
+        // 续写回调从池里再取一次永远是 None。账号不挂在 `ChatRequest` 上
+        // （它对外是公开结构），而是单独交给 `maybe_supervise`。
+        let session_account = account.clone();
         let inner = ResponseStream::new(
             Box::pin(stream),
             guard,
@@ -906,13 +935,13 @@ impl Chat {
                     .as_ref()
                     .map_or_else(Vec::new, |d| d.chain.clone()),
             },
-            account_id.clone(),
+            account_id,
             self.auto_resume
                 .read()
                 .expect("auto_resume 锁中毒")
                 .thinking_heartbeat_secs,
         );
-        let inner = self.maybe_supervise(inner, req, request_id);
+        let inner = self.maybe_supervise(inner, req, request_id, session_account);
         let stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, CoreError>> + Send>> =
             Box::pin(inner);
         Ok(ChatResponse { stream })
@@ -921,8 +950,21 @@ impl Chat {
 
 // ── 截断续写 ──────────────────────────────────────────────────────────
 
-/// 续写回调所需的共享状态：(账号池, 原始请求, request_id, 用空 prompt 续写)
-type SharedReplier = Arc<Mutex<Option<(Arc<Accounts>, ChatRequest, String, bool)>>>;
+/// 续写回调所需的共享状态
+struct ReplierSeed {
+    accounts: Arc<Accounts>,
+    req: ChatRequest,
+    request_id: String,
+    empty_prompt: bool,
+    /// 本轮占用该流的账号。续写必须沿用它：会话属于该账号的设备身份，
+    /// 换账号只会拿到「会话不存在」；同时本轮还持有它的 `AccountGuard`（busy），
+    /// 从池里再取一次永远是 `None` —— 这正是 auto_resume 曾一直报
+    /// `no available account` 的原因。
+    session_account: Arc<crate::accounts::Account>,
+}
+
+/// (共享状态, 用空 prompt 续写)
+type SharedReplier = Arc<Mutex<Option<ReplierSeed>>>;
 
 /// 构造注入 `ResponseStream` 的续写回调
 ///
@@ -932,29 +974,51 @@ type SharedReplier = Arc<Mutex<Option<(Arc<Accounts>, ChatRequest, String, bool)
 fn build_replier(shared: SharedReplier) -> super::resume::ResumeReplier {
     Box::new(move |ticket: super::resume::ResumeTicket| {
         let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((accounts, req, request_id, empty_prompt)) = state.take() else {
+        let Some(ReplierSeed {
+            accounts,
+            req,
+            request_id,
+            empty_prompt,
+            session_account,
+        }) = state.take()
+        else {
             return Box::pin(async {
                 Err(CoreError::ProviderError("续写状态已释放".into()))
             });
         };
-        let model_type = req.model_type.clone();
-        let thinking_enabled = req.thinking_enabled;
-        let search_enabled = req.search_enabled;
+        let params = ResumeParams {
+            model_type: req.model_type.clone(),
+            thinking_enabled: req.thinking_enabled,
+            search_enabled: req.search_enabled,
+        };
         // 一次性消费：续写失败后不再重试（上限由流侧计数控制）
         drop(state);
+        log::debug!(
+            target: "ds_core::accounts",
+            "req={} 续写任务开始: session_id={}, parent={}",
+            request_id,
+            ticket.session_id,
+            ticket.parent_message_id
+        );
         Box::pin(async move {
             resume_completion(
                 &accounts,
                 &request_id,
                 ticket,
                 empty_prompt,
-                model_type,
-                thinking_enabled,
-                search_enabled,
+                &params,
+                session_account,
             )
             .await
         })
     })
+}
+
+/// 续写的模型侧参数（与 `ReplierSeed` 的其余字段分开，避免超长参数列表）
+struct ResumeParams {
+    model_type: String,
+    thinking_enabled: bool,
+    search_enabled: bool,
 }
 
 /// 真正执行一次续写 completion
@@ -963,26 +1027,38 @@ async fn resume_completion(
     request_id: &str,
     ticket: super::resume::ResumeTicket,
     empty_prompt: bool,
-    model_type: String,
-    thinking_enabled: bool,
-    search_enabled: bool,
+    params: &ResumeParams,
+    session_account: Arc<crate::accounts::Account>,
 ) -> Result<super::resume::ResumedStream, CoreError> {
-    let guard = accounts
-        .get_account_with_wait(30_000)
-        .await
-        .ok_or(CoreError::Overloaded)?;
-    let account = guard.account_arc();
-    let pow_header = accounts
-        .compute_pow_for_target(&account, "/api/v0/chat/completion")
-        .await?;
+    let account = session_account;
+    log::debug!(
+        target: "ds_core::accounts",
+        "req={request_id} 续写: 计算 PoW"
+    );
+    let client = account.client();
+    let token = account.token();
+    let challenge_data = client
+        .create_pow_challenge(&token, "/api/v0/chat/completion")
+        .await;
+    log::debug!(
+        target: "ds_core::accounts",
+        "req={request_id} 续写: challenge 获取结果 ok={}",
+        challenge_data.is_ok()
+    );
+    let challenge_data = challenge_data?;
+    let pow_header = accounts.solve_challenge(&challenge_data)?;
+    log::debug!(
+        target: "ds_core::accounts",
+        "req={request_id} 续写: PoW 完成"
+    );
     let payload = CompletionPayload {
         chat_session_id: ticket.session_id.clone(),
         parent_message_id: Some(ticket.parent_message_id),
-        model_type,
+        model_type: params.model_type.clone(),
         prompt: super::resume::resume_prompt(empty_prompt),
         ref_file_ids: Vec::new(),
-        thinking_enabled,
-        search_enabled,
+        thinking_enabled: params.thinking_enabled,
+        search_enabled: params.search_enabled,
         action: None,
         source: crate::accounts::COMPLETION_SOURCE_DEFAULT,
         preempt: false,
@@ -994,30 +1070,32 @@ async fn resume_completion(
         ticket.session_id,
         ticket.parent_message_id
     );
-    let mut raw = accounts.completion(&account, &pow_header, &payload).await?;
-
-    // 丢掉 ready + hint 两个事件（续写时下游已经收过 Meta），重新取 stop_id
-    let mut buf = Vec::new();
-    let mut text = String::new();
-    let (ready_block, second_block) = loop {
-        let chunk = raw
-            .next()
-            .await
-            .ok_or_else(|| CoreError::Stream("续写流为空".into()))?
-            .map_err(|e| CoreError::Stream(e.to_string()))?;
-        buf.extend_from_slice(&chunk);
-        text.push_str(&String::from_utf8_lossy(&chunk));
-        if let Some((a, b)) = split_two_events(&text) {
-            break (a.to_owned(), b.to_owned());
-        }
-    };
-    if let Some(err) = check_hint(&second_block) {
+    let raw = accounts.completion(&account, &pow_header, &payload).await;
+    if let Err(e) = &raw {
         log::warn!(
             target: "ds_core::accounts",
-            "req={request_id} 续写 hint 错误"
+            "req={request_id} 续写 completion 请求失败: {e:?}"
         );
-        return Err(err);
     }
+    let mut raw = raw?;
+
+    // 只取出首个 `\n\n` 分隔的事件块（ready）。后续字节（hint / close /
+    // 首个正文帧）全部原样交给新流解析 —— 续写流可能只有 ready + close，
+    // 也可能 ready 之后立刻就有正文，缓冲区里绝不能丢掉任何一帧。
+    let mut buf = Vec::new();
+    let ready_block = loop {
+        if let Some(idx) = find_event_boundary(&buf) {
+            let block = String::from_utf8_lossy(&buf[..idx]).into_owned();
+            let consumed = idx + 4; // 连同 `\n\n`
+            buf.drain(..consumed);
+            break block;
+        }
+        let Some(chunk) = raw.next().await else {
+            return Err(CoreError::Stream("续写流为空".into()));
+        };
+        buf.extend_from_slice(&chunk.map_err(|e| CoreError::Stream(e.to_string()))?);
+    };
+
     let (_, message_id) = parse_ready_message_ids(ready_block.as_bytes());
 
     // 上游 ready 之后可能还有同一批事件里剩余的字节：把 buf 里 ready 之外的部分
@@ -1158,9 +1236,36 @@ fn split_history_prompt(prompt: &str) -> (String, String) {
     (prompt.to_string(), String::new())
 }
 
+/// 在 SSE 字节缓冲区里定位第一个事件分隔（`\n\n` 或 `\r\n\r\n`）。
+///
+/// 续写握手只需要把首个 `ready` 事件整块取出来，后面的字节（hint、close、
+/// 首个正文帧）必须原样留给新流，所以这里只返回分隔符起点，由调用方决定消费长度。
+fn find_event_boundary(buf: &[u8]) -> Option<usize> {
+    let lf = buf.windows(2).position(|w| w == b"\n\n");
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 续写握手只吃首个事件块：ready 后面的字节（hint / close / 首个正文帧）
+    /// 必须原样留给新流，任何一帧都不能丢。
+    #[test]
+    fn find_event_boundary_takes_first_block_only() {
+        assert_eq!(find_event_boundary(b"data: a\n\ndata: b\n\n"), Some(7));
+        assert_eq!(
+            find_event_boundary(b"event: close\r\n\r\ndata: {}\n\n"),
+            Some(12)
+        );
+        assert_eq!(find_event_boundary(b"data: a\n\r\n"), None);
+        assert_eq!(find_event_boundary(b"data: partial"), None);
+    }
 
     /// 每个 chunk 都必须以完整标签开头，且不得把 `<｜Role｜>` 切成两半
     fn assert_tags_intact(chunks: &[String]) {

@@ -165,7 +165,7 @@ pub(crate) struct DeviceTokens {
 }
 
 impl DeviceTokens {
-    const fn get(&self, kind: HifKind) -> &Arc<HifToken> {
+    pub(crate) const fn get(&self, kind: HifKind) -> &Arc<HifToken> {
         match kind {
             HifKind::Leim => &self.leim,
             HifKind::Dliq => &self.dliq,
@@ -299,7 +299,7 @@ impl HifToken {
 
     /// 写入缓存（仅测试用：避免单测触网）
     #[cfg(test)]
-    async fn seed_for_test(&self, value: &str, ttl: Duration) {
+    pub(crate) async fn seed_for_test(&self, value: &str, ttl: Duration) {
         let mut state = self.state.lock().await;
         state.cached = Some(Cached {
             value: value.to_string(),
