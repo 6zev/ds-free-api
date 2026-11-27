@@ -742,7 +742,7 @@ impl DsClient {
         let resp = self
             .http
             .get(format!("{}{}", self.api_base, ENDPOINT_USERS_CURRENT))
-            .headers(self.auth_headers(token)?)
+            .headers(self.authed_headers(token).await?)
             .send()
             .await?;
         Self::parse_envelope::<UserInfo>(resp).await
@@ -759,7 +759,7 @@ impl DsClient {
                 "{}{}",
                 self.api_base, ENDPOINT_USERS_AUTH_TOKEN_CHECK_DEVICE
             ))
-            .headers(self.auth_headers(token)?)
+            .headers(self.authed_headers(token).await?)
             .json(&serde_json::json!({
                 "device_id": self.identity.device_id,
                 "device_model": self.identity.device_model,
@@ -788,7 +788,7 @@ impl DsClient {
                 "{}{}",
                 self.api_base, ENDPOINT_CHAT_SESSION_FETCH_PAGE
             ))
-            .headers(self.auth_headers(token)?)
+            .headers(self.authed_headers(token).await?)
             .query(&query)
             .send()
             .await?;
@@ -799,7 +799,7 @@ impl DsClient {
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_SESSION_CREATE))
-            .headers(self.auth_headers(token)?)
+            .headers(self.authed_headers(token).await?)
             .json(&serde_json::json!({}))
             .send()
             .await?;
@@ -812,7 +812,7 @@ impl DsClient {
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_SESSION_DELETE))
-            .headers(self.auth_headers(token)?)
+            .headers(self.authed_headers(token).await?)
             .json(&serde_json::json!({ "chat_session_id": session_id }))
             .send()
             .await?;
@@ -841,6 +841,34 @@ impl DsClient {
         Ok(challenge)
     }
 
+    /// 带风控令牌的业务请求头：鉴权 + `x-hif-leim` / `x-hif-dliq`
+    ///
+    /// 真实客户端把风险令牌附加到**每个**业务请求上，不只是 SSE。统一的入口
+    /// 让所有带 Bearer 的调用点都不必各自记得补 `attach_hif`。
+    async fn authed_headers(&self, token: &str) -> Result<wreq::header::HeaderMap, ClientError> {
+        let mut headers = self.auth_headers(token)?;
+        self.attach_hif(&mut headers).await?;
+        Ok(headers)
+    }
+
+    /// 带风控令牌 + PoW 与鉴权的业务请求头
+    ///
+    /// 上传等需要 PoW 的非流式请求走这里：先拿鉴权与风控令牌，再追加
+    /// `X-Ds-Pow-Response`。缺风控令牌的请求会被上游/代理静默丢弃。
+    async fn authed_headers_with_pow(
+        &self,
+        token: &str,
+        pow_response: &str,
+    ) -> Result<wreq::header::HeaderMap, ClientError> {
+        let mut headers = self.authed_headers(token).await?;
+        headers.insert(
+            "X-Ds-Pow-Response",
+            wreq::header::HeaderValue::from_str(pow_response)
+                .map_err(|e| ClientError::InvalidHeader(format!("X-Ds-Pow-Response: {e}")))?,
+        );
+        Ok(headers)
+    }
+
     /// PoW challenge 请求头：鉴权（可选）+ 风控令牌（`x-hif-leim` / `x-hif-dliq`）
     ///
     /// 真实客户端把风险令牌附加到**每个**业务请求上，challenge 也不例外；
@@ -849,10 +877,10 @@ impl DsClient {
         &self,
         token: Option<&str>,
     ) -> Result<wreq::header::HeaderMap, ClientError> {
-        let mut headers = match token {
-            Some(token) => self.auth_headers(token)?,
-            None => self.client_headers()?,
-        };
+        if let Some(token) = token {
+            return self.authed_headers(token).await;
+        }
+        let mut headers = self.client_headers()?;
         self.attach_hif(&mut headers).await?;
         Ok(headers)
     }
@@ -949,7 +977,7 @@ impl DsClient {
                 "{}{}",
                 self.api_base, ENDPOINT_CHAT_SESSION_UPDATE_TITLE
             ))
-            .headers(self.auth_headers(token)?)
+            .headers(self.authed_headers(token).await?)
             .json(payload)
             .send()
             .await?;
@@ -966,7 +994,7 @@ impl DsClient {
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_STOP_STREAM))
-            .headers(self.auth_headers(token)?)
+            .headers(self.authed_headers(token).await?)
             .json(payload)
             .send()
             .await?;
@@ -991,7 +1019,7 @@ impl DsClient {
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_FILE_UPLOAD))
-            .headers(self.auth_headers_with_pow(token, pow_response)?)
+            .headers(self.authed_headers_with_pow(token, pow_response).await?)
             .multipart(form)
             .send()
             .await?;
@@ -1008,7 +1036,7 @@ impl DsClient {
         let resp = self
             .http
             .get(format!("{}{}", self.api_base, ENDPOINT_FILE_FETCH))
-            .headers(self.auth_headers(token)?)
+            .headers(self.authed_headers(token).await?)
             .query(&[("file_ids", &ids)])
             .send()
             .await?;
@@ -1325,6 +1353,55 @@ mod tests {
             headers["x-device-id"],
             "11111111-2222-4333-8444-555555555555"
         );
+    }
+
+    /// 回归：普通鉴权业务请求也必须带 `x-hif-leim` / `x-hif-dliq`。
+    ///
+    /// `create_session` / `stop_stream` / `fetch_files` 等非 SSE 调用曾经只用裸
+    /// `auth_headers`。真实客户端的风险令牌覆盖每一个业务请求，漏掉的调用点会被
+    /// 上游当成非官方客户端（创建会话失败 → 整条链路不可用）。这里同时覆盖
+    /// `authed_headers` 与 `authed_headers_with_pow`（上传文件走后者）。
+    #[tokio::test]
+    async fn business_requests_carry_hif_headers() {
+        let mut identity = test_identity();
+        identity.device_id = "22222222-3333-4444-8555-666666666666".to_string();
+        let client = DsClient::new(
+            "http://127.0.0.1:1/api/v0".to_string(),
+            "https://example.com/x.wasm".to_string(),
+            identity,
+            &HifConfig::default(),
+            EmulationProfile::default(),
+            None,
+            &[],
+        );
+        let tokens = client
+            .hif
+            .as_ref()
+            .expect("HIF 注册表应存在")
+            .tokens_for(client.device_id());
+        tokens
+            .get(HifKind::Leim)
+            .seed_for_test("leim-v", std::time::Duration::from_mins(10))
+            .await;
+        tokens
+            .get(HifKind::Dliq)
+            .seed_for_test("dliq-v", std::time::Duration::from_mins(10))
+            .await;
+
+        let headers = client
+            .authed_headers("MOCK-TOKEN")
+            .await
+            .expect("构造鉴权请求头失败");
+        assert_eq!(headers["x-hif-leim"], "leim-v");
+        assert_eq!(headers["x-hif-dliq"], "dliq-v");
+        assert_eq!(headers["authorization"], "Bearer MOCK-TOKEN");
+
+        let pow_headers = client
+            .authed_headers_with_pow("MOCK-TOKEN", "MOCK-POW")
+            .await
+            .expect("构造鉴权 + PoW 请求头失败");
+        assert_eq!(pow_headers["x-hif-leim"], "leim-v");
+        assert_eq!(pow_headers["x-ds-pow-response"], "MOCK-POW");
     }
 
     #[test]

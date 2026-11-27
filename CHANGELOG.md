@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.4] - 2026-11-27
+
+### 修复：所有鉴权业务请求补齐风控令牌（`x-hif-leim` / `x-hif-dliq`）
+
+- 真实客户端把风险令牌附加到**每一个**业务请求，而不只是 SSE。此前只有
+  `completion` / `edit_message` / `create_pow_challenge` 走带令牌的路径，其余
+  8 个调用点用的是裸 `auth_headers`：
+  `current_user`、`check_device`、`fetch_sessions`、`create_session`、
+  `delete_session`、`update_title`、`stop_stream`、`fetch_files`；
+  `upload_file` 的 `auth_headers_with_pow` 同样缺令牌。
+- 其中 `create_session` 紧贴 completion 之前触发、`stop_stream` 在流异常结束时触发，
+  缺令牌时可能被上游/代理静默丢弃 —— 表现为「会话创建失败 / 取消请求无效」而不是
+  明确的报错。
+- **改动**：在客户端新增 `authed_headers()`（鉴权 + `attach_hif`）与
+  `authed_headers_with_pow()`（再追加 `X-Ds-Pow-Response`），上述调用点统一改走
+  新入口；`pow_challenge_headers(Some(token))` 也复用它。`hif_enabled = false` 时
+  `attach_hif` 为空操作，行为与旧版本一致。
+- 新增回归 `business_requests_carry_hif_headers`，与既有的
+  `pow_challenge_carries_hif_headers` 一起固定「鉴权请求必须带风控令牌」。
+
 ## [0.6.3] - 2026-11-27
 
 ### 修复：`[ds_core.auto_resume]` 开启后请求永久挂起（续写 future 被 drop）
