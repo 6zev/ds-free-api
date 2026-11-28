@@ -155,9 +155,20 @@ port = 22217
 # 若确需启用：model_types = ["default", "expert", "vision"]
 #
 # model_types = ["default"]
+#
+# 元数据来源（model_metadata_source）：
+#   auto   （默认）对外只暴露实测常量：max_input_tokens = 1048576、
+#          max_output_tokens = 384000，逐类型填充，忽略下面的数组
+#   config 按下面的数组逐项下发（长度必须与 model_types 相同）
+# model_metadata_source = "auto"
 # max_input_tokens = [1048576]
 # max_output_tokens = [384000]
-# 上游对全部 model_type 均返回 input_character_limit = 2621440
+#
+# 三者性质不同，别混：
+#   input_character_limit = 2621440  唯一有上游出处
+#              （/api/v0/client/settings → settings.model_types[].input_character_limit）
+#   max_input_tokens = 1048576       实测常量（1624k 字符按中英混合折算）
+#   max_output_tokens = 384000       实测常量（上游无任何输出上限字段，这是默认输出预算）
 # input_character_limits = [2621440]
 
 # 模型别名（可选，按 index 对齐 model_types，默认无别名）
@@ -254,6 +265,24 @@ port = 22217
 # 每条缓存只保存一轮的 output 数组（通常几 KB）。
 # responses_store_capacity = 256    # 最多保存多少轮（默认 256）
 # responses_store_ttl_secs = 3600   # 条目存活秒数（默认 3600）
+
+# ── OTA 自更新（GitHub Releases）────────────────────────────────────────
+#
+# 只走 GitHub Releases：检查最新 tag → 下载本平台产物 → 用同一次发布里的
+# SHA256SUMS 校验 → 原子替换磁盘上的二进制。**替换后需要重启进程**（systemd /
+# docker / 手动）才生效；重启失败可用管理面板回滚。
+#
+# 安全边界：校验和与产物同源，只能防传输损坏和镜像劫持，防不住发布账号被接管
+# —— 与 `curl | bash` 同一风险等级。不信任 `6zev/ds-free-api` 就别开。
+#
+# [update]
+# enabled = false                # 总开关；关闭时 /admin/api/update/* 一律拒绝
+# check_on_startup = false       # 启动时查一次（只查不装，结果写日志 + 面板）
+# allow_apply = true             # 允许「下载并替换」；false = 只允许检查
+# repo = "6zev/ds-free-api"      # 仓库
+# use_latest = true              # true = /releases/latest；false = 用 target_tag
+# target_tag = ""                # 固定版本（例如 "v0.7.0"），use_latest = false 时生效
+# api_base = "https://api.github.com"  # 私有镜像 / 企业版可改
 
 # Admin 配置（由管理面板自动管理，部署时无需手动填写）
 # [admin]

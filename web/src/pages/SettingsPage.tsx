@@ -1,6 +1,16 @@
 import { useEffect, useState, useRef } from 'react';
 import { useOutletContext } from 'react-router-dom';
-import { apiFetchConfig, apiSaveConfig, localizeAuthError, type FullConfig } from '@/lib/api';
+import {
+  apiFetchConfig,
+  apiSaveConfig,
+  localizeAuthError,
+  apiUpdateInfo,
+  apiUpdateCheck,
+  apiUpdateApply,
+  type FullConfig,
+  type UpdateInfo,
+  type UpdateCheckResult,
+} from '@/lib/api';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -17,6 +27,8 @@ import {
   AlertCircle,
   Lock,
   Search,
+  DownloadCloud,
+  RefreshCw,
 } from 'lucide-react';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useTranslation } from 'react-i18next';
@@ -28,6 +40,54 @@ export function SettingsPage() {
   const [initialConfig, setInitialConfig] = useState<string>('');
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  // OTA 自更新状态（与配置无关，独立于 isDirty 跟踪）
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateCheck, setUpdateCheck] = useState<UpdateCheckResult | null>(null);
+  const [updateBusy, setUpdateBusy] = useState<'check' | 'apply' | null>(null);
+  const [updateMsg, setUpdateMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  useEffect(() => {
+    apiUpdateInfo()
+      .then(setUpdateInfo)
+      .catch(() => setUpdateInfo(null));
+  }, []);
+
+  const handleUpdateCheck = async () => {
+    setUpdateBusy('check');
+    setUpdateMsg(null);
+    try {
+      const result = await apiUpdateCheck();
+      setUpdateCheck(result);
+      setUpdateInfo((prev) =>
+        prev ? { ...prev, status: result.status } : prev
+      );
+      setUpdateMsg({
+        type: 'ok',
+        text: result.update_available
+          ? t('settings.updateAvailable', { latest: result.latest })
+          : t('settings.updateUpToDate', { current: result.current }),
+      });
+    } catch (e) {
+      setUpdateMsg({ type: 'err', text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setUpdateBusy(null);
+    }
+  };
+
+  const handleUpdateApply = async () => {
+    setUpdateBusy('apply');
+    setUpdateMsg(null);
+    try {
+      const result = await apiUpdateApply();
+      setUpdateInfo((prev) => (prev ? { ...prev, status: result.status } : prev));
+      setUpdateMsg({ type: 'ok', text: t('settings.updateReady') });
+    } catch (e) {
+      setUpdateMsg({ type: 'err', text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setUpdateBusy(null);
+    }
+  };
 
   // Password change state
   const [oldPassword, setOldPassword] = useState('');
@@ -817,6 +877,157 @@ export function SettingsPage() {
                 className="font-mono text-xs"
               />
             </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* ── OTA 自更新 ── */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base font-semibold flex items-center gap-2">
+            <DownloadCloud className="h-4 w-4 text-primary" />
+            <span>{t('settings.otaTitle')}</span>
+            {updateInfo && (
+              <span className="text-xs font-mono font-normal text-muted-foreground">
+                {updateInfo.current} · {updateInfo.deploy_id}
+              </span>
+            )}
+          </CardTitle>
+          <CardDescription className="text-xs">{t('settings.otaDesc')}</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4 pt-2">
+          <label
+            htmlFor="set-update-enabled"
+            className="flex items-center gap-3 cursor-pointer select-none"
+          >
+            <input
+              id="set-update-enabled"
+              type="checkbox"
+              checked={config.update.enabled}
+              onChange={(e) => update(['update', 'enabled'], e.target.checked)}
+              className="h-4 w-4 rounded border-input accent-primary cursor-pointer"
+            />
+            <span className="text-xs font-mono">
+              enabled = {String(config.update.enabled)}
+            </span>
+          </label>
+          <div>
+            <label
+              htmlFor="set-update-check-startup"
+              className="flex items-center gap-3 cursor-pointer select-none"
+            >
+              <input
+                id="set-update-check-startup"
+                type="checkbox"
+                checked={config.update.check_on_startup}
+                onChange={(e) => update(['update', 'check_on_startup'], e.target.checked)}
+                className="h-4 w-4 rounded border-input accent-primary cursor-pointer"
+              />
+              <span className="text-xs font-mono">
+                check_on_startup = {String(config.update.check_on_startup)}
+              </span>
+            </label>
+          </div>
+          <div>
+            <label
+              htmlFor="set-update-allow-apply"
+              className="flex items-center gap-3 cursor-pointer select-none"
+            >
+              <input
+                id="set-update-allow-apply"
+                type="checkbox"
+                checked={config.update.allow_apply}
+                onChange={(e) => update(['update', 'allow_apply'], e.target.checked)}
+                className="h-4 w-4 rounded border-input accent-primary cursor-pointer"
+              />
+              <span className="text-xs font-mono">
+                allow_apply = {String(config.update.allow_apply)}
+              </span>
+            </label>
+            <p className="text-[11px] text-muted-foreground mt-1.5">
+              {t('settings.otaAllowApplyDesc')}
+            </p>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label
+                htmlFor="set-update-repo"
+                className="text-xs font-medium text-muted-foreground block mb-1.5"
+              >
+                repo
+              </label>
+              <Input
+                id="set-update-repo"
+                value={config.update.repo}
+                onChange={(e) => update(['update', 'repo'], e.target.value)}
+                className="font-mono text-xs"
+                placeholder="6zev/ds-free-api"
+              />
+            </div>
+            <div>
+              <label
+                htmlFor="set-update-api-base"
+                className="text-xs font-medium text-muted-foreground block mb-1.5"
+              >
+                api_base
+              </label>
+              <Input
+                id="set-update-api-base"
+                value={config.update.api_base}
+                onChange={(e) => update(['update', 'api_base'], e.target.value)}
+                className="font-mono text-xs"
+                placeholder="https://api.github.com"
+              />
+            </div>
+          </div>
+          <div className="space-y-3 pt-1 border-t">
+            <div className="flex flex-wrap items-center gap-2 pt-3">
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 gap-1.5 text-xs"
+                onClick={handleUpdateCheck}
+                disabled={updateBusy !== null}
+              >
+                <RefreshCw className={cn('h-3.5 w-3.5', updateBusy === 'check' && 'animate-spin')} />
+                {t('settings.otaCheck')}
+              </Button>
+              <Button
+                size="sm"
+                className="h-8 gap-1.5 text-xs shadow-sm"
+                onClick={handleUpdateApply}
+                disabled={
+                  updateBusy !== null ||
+                  !updateCheck?.update_available ||
+                  !config.update.enabled ||
+                  !config.update.allow_apply
+                }
+              >
+                <DownloadCloud className="h-3.5 w-3.5" />
+                {updateBusy === 'apply' ? t('settings.otaApplying') : t('settings.otaApply')}
+              </Button>
+              {updateInfo && (
+                <Badge variant="secondary" className="text-[11px] font-mono">
+                  {updateInfo.status.state}
+                </Badge>
+              )}
+            </div>
+            {updateMsg && (
+              <p
+                className={cn(
+                  'text-xs flex items-start gap-1.5',
+                  updateMsg.type === 'ok' ? 'text-green-600' : 'text-destructive'
+                )}
+              >
+                {updateMsg.type === 'ok' ? (
+                  <CheckCircle2 className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                ) : (
+                  <AlertCircle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                )}
+                <span className="break-all">{updateMsg.text}</span>
+              </p>
+            )}
+            <p className="text-[11px] text-muted-foreground">{t('settings.otaRestartHint')}</p>
           </div>
         </CardContent>
       </Card>

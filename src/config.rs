@@ -16,6 +16,9 @@ pub struct Config {
     /// 代理配置（可选，用于绕过 WAF）
     #[serde(default)]
     pub proxy: ProxyConfig,
+    /// OTA 自更新配置（对应 `[update]` 段）
+    #[serde(default)]
+    pub update: UpdateSection,
     /// Admin 配置（bcrypt 密码哈希、JWT 密钥等，由管理面板管理）
     #[serde(default)]
     pub admin: AdminConfig,
@@ -156,9 +159,52 @@ pub struct DsCoreSection {
     /// Responses API 上下文缓存存活秒数（默认 3600）
     #[serde(default = "default_responses_store_ttl_secs")]
     pub responses_store_ttl_secs: u64,
+    /// 模型列表元数据的来源（`auto` = 上游 / 本地实测 / 配置值 逐项回填，默认）
+    ///
+    /// 上游只给出 `input_character_limit`（字符数），token 上限并没有公开接口；
+    /// `auto` 下本代理按 `input_character_limits`/`max_input_tokens`/`max_output_tokens`
+    /// 逐项回填，缺项时用内置实测值。设为 `manual` 则完全使用配置文件里的数值。
+    #[serde(default = "default_model_metadata_source")]
+    pub model_metadata_source: String,
 }
 
+/// 实测输入上限（1M 上下文，DeepSeek 官方文档 + 本地实测）
+pub const MEASURED_MAX_INPUT_TOKENS: u32 = 1_048_576;
+
+/// 实测输出上限（默认输出预算）
+pub const MEASURED_MAX_OUTPUT_TOKENS: u32 = 384_000;
+
 impl DsCoreSection {
+    /// 该模型类型对外暴露的输入 token 上限
+    ///
+    /// **上游没有 token 上限接口**：`/api/v0/client/settings` 只返回
+    /// `input_character_limit`（字符数）。所以 1048576 是实测常量 —— 它同时是
+    /// DeepSeek 官方文档写明的 1M 上下文，也是本项目本地实测的可用上限。
+    /// 配置值只是「覆盖」，不是真相来源；`model_metadata_source = "config"`
+    /// 才是纯配置驱动。
+    #[must_use]
+    pub const fn resolved_max_input_tokens(&self, _idx: usize) -> Option<u32> {
+        Some(MEASURED_MAX_INPUT_TOKENS)
+    }
+
+    /// 该模型类型对外暴露的输出 token 上限
+    ///
+    /// 同上：SSE 里没有任何输出上限字段，384000 是实测常量（默认输出预算）。
+    #[must_use]
+    pub const fn resolved_max_output_tokens(&self, _idx: usize) -> Option<u32> {
+        Some(MEASURED_MAX_OUTPUT_TOKENS)
+    }
+
+    /// 该模型类型对外暴露的输入字符数上限
+    ///
+    /// 这是唯一有上游出处的元数据：`/api/v0/client/settings` →
+    /// `settings.model_types[].input_character_limit`，当前所有类型均为 2621440。
+    /// 配置值默认就写这个数；上游改了就改配置（或开 `auto` 探测）。
+    #[must_use]
+    pub fn resolved_input_character_limit(&self, idx: usize) -> Option<u32> {
+        self.input_character_limits.get(idx).copied()
+    }
+
     /// 生成 OpenAI 模型注册表映射
     #[must_use]
     /// 构建 model_id → model_type 的映射表
@@ -340,7 +386,10 @@ const fn default_responses_store_capacity() -> usize {
     256
 }
 
-/// Responses API 上下文缓存存活时间
+fn default_model_metadata_source() -> String {
+    "auto".to_string()
+}
+
 const fn default_responses_store_ttl_secs() -> u64 {
     3600
 }
@@ -530,6 +579,7 @@ impl Config {
                     cors_origins: default_cors_origins(),
                 },
                 proxy: ProxyConfig::default(),
+                update: UpdateSection::default(),
                 admin: AdminConfig::default(),
                 api_keys: Vec::new(),
             };
@@ -638,6 +688,7 @@ impl Default for DsCoreSection {
             default_search_enabled: default_search_enabled(),
             responses_store_capacity: default_responses_store_capacity(),
             responses_store_ttl_secs: default_responses_store_ttl_secs(),
+            model_metadata_source: default_model_metadata_source(),
         }
     }
 }
@@ -655,6 +706,69 @@ pub enum ConfigError {
     Cli(String),
     #[error("TOML 序列化错误: {0}")]
     TomlSerialization(#[from] toml::ser::Error),
+}
+
+/// OTA 自更新配置段 —— 对应 config.toml 的 `[update]`
+///
+/// 只在显式开启 `enabled` 后才会访问 GitHub；默认关闭，避免离线部署时
+/// 每次启动都去打外网。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "对应 [update] TOML 段，逐字段平铺"
+)]
+pub struct UpdateSection {
+    /// 是否启用自更新（默认 false）
+    #[serde(default)]
+    pub enabled: bool,
+    /// 启动时检查一次更新（只检查，不自动替换；默认 false）
+    #[serde(default)]
+    pub check_on_startup: bool,
+    /// 是否允许从管理面板触发「下载并替换」（默认 true；`enabled = false` 时无效）
+    #[serde(default = "default_update_allow_apply")]
+    pub allow_apply: bool,
+    /// 发布仓库（`owner/repo`）
+    #[serde(default = "default_update_repo")]
+    pub repo: String,
+    /// 是否优先使用 `releases/latest`（预发布 / 固定版本时置 false 并写 `target_tag`）
+    #[serde(default = "default_update_use_latest")]
+    pub use_latest: bool,
+    /// 固定目标 tag（仅在 `use_latest = false` 时生效）
+    #[serde(default)]
+    pub target_tag: String,
+    /// GitHub API 基础地址（私有镜像 / 企业版可改）
+    #[serde(default = "default_update_api_base")]
+    pub api_base: String,
+}
+
+fn default_update_api_base() -> String {
+    "https://api.github.com".to_string()
+}
+
+const fn default_update_allow_apply() -> bool {
+    true
+}
+
+fn default_update_repo() -> String {
+    "6zev/ds-free-api".to_string()
+}
+
+const fn default_update_use_latest() -> bool {
+    true
+}
+
+impl Default for UpdateSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            check_on_startup: false,
+            allow_apply: default_update_allow_apply(),
+            repo: default_update_repo(),
+            use_latest: default_update_use_latest(),
+            target_tag: String::new(),
+            api_base: default_update_api_base(),
+        }
+    }
 }
 
 /// 长思考保护配置段 —— 对应 config.toml 的 `[ds_core.auto_resume]`

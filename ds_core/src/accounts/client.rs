@@ -936,6 +936,41 @@ impl DsClient {
         Ok(Box::pin(resp.bytes_stream().map_err(ClientError::Http)))
     }
 
+    /// 用本客户端（同一拟态身份 / 代理）取任意 URL 的文本
+    ///
+    /// 只用于非 DeepSeek 域的辅助请求（GitHub Releases、镜像）。不复用
+    /// `parse_envelope`：这些域返回的是裸 JSON / 文本，没有上游信封。
+    pub async fn get_text(&self, url: &str) -> Result<(u16, String), ClientError> {
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.identity.headers(FetchSite::CrossSite)?)
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
+    /// 用本客户端取任意 URL 的原始字节（发布产物下载）
+    pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, ClientError> {
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.identity.headers(FetchSite::CrossSite)?)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ClientError::Status {
+                status: status.as_u16(),
+                body: format!("HTTP {status}"),
+            });
+        }
+        let bytes = resp.bytes().await?;
+        Ok(bytes.to_vec())
+    }
+
     #[allow(dead_code)]
     pub async fn edit_message(
         &self,

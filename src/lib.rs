@@ -2,6 +2,7 @@ pub mod anthropic_compat;
 pub mod config;
 pub mod openai_adapter;
 pub mod responses_adapter;
+pub mod self_update;
 pub mod server;
 
 pub use anthropic_compat::AnthropicCompat;

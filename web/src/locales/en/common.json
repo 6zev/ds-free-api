@@ -204,7 +204,17 @@
     "autoResumeDesc": "Automatically continue generation when upstream truncates a long thinking turn.",
     "autoResumeAttemptsLabel": "Max resume attempts",
     "autoResumeAttemptsDesc": "How many resume rounds a single request may trigger.",
-    "loginEncryptionDesc": "Encrypt /api/v0/users/* POST bodies (login included) exactly like the official client."
+    "loginEncryptionDesc": "Encrypt /api/v0/users/* POST bodies (login included) exactly like the official client.",
+    "otaTitle": "System update (OTA)",
+    "otaDesc": "Check GitHub Releases and apply a new version: download this platform's asset → verify SHA256 → atomically replace the binary. A process restart is required.",
+    "otaAllowApplyDesc": "When off, only checking is allowed — no download or replace.",
+    "otaCheck": "Check for updates",
+    "otaApply": "Download & replace",
+    "otaApplying": "Downloading…",
+    "otaRestartHint": "Restart the service after the replacement (systemd / docker restart / manual) for the new version to take effect.",
+    "updateAvailable": "New version {{latest}} is available.",
+    "updateUpToDate": "{{current}} is already the latest version.",
+    "updateReady": "Binary replaced — restart the service to apply."
   },
   "logs": {
     "title": "Logs",

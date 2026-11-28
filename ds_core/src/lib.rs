@@ -120,6 +120,21 @@ impl DsCore {
         }
     }
 
+    /// 用同一个（拟态身份 + 代理）HTTP 客户端取 `GET url` 的文本
+    ///
+    /// 自更新（OTA）与 `client/settings` 元数据探测都走这里，而不是在根 crate
+    /// 里另加一个 HTTP 客户端依赖 —— 这样 GitHub / 上游请求带的是同一套 TLS
+    /// 指纹与 `[proxy]` 配置。返回 `(status, body)`；非 2xx 也返回 body，
+    /// 由调用方决定是否报错。
+    pub async fn fetch_text(&self, url: &str) -> Result<(u16, String), CoreError> {
+        self.accounts.fetch_text(url).await
+    }
+
+    /// 用同一个 HTTP 客户端取 `GET url` 的原始字节（下载发布产物用）
+    pub async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, CoreError> {
+        self.accounts.fetch_bytes(url).await
+    }
+
     pub async fn reload_config(&self, config: &DsCoreConfig) -> Result<(), CoreError> {
         self.chat.reload_auto_resume(&config.auto_resume);
         self.accounts.reload_config(config).await

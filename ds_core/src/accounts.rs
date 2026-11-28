@@ -294,6 +294,24 @@ impl Accounts {
         self.pool.re_login_single(email_or_mobile).await
     }
 
+    /// 用共享的拟态客户端取任意 URL 的文本（`(status, body)`）
+    pub async fn fetch_text(&self, url: &str) -> Result<(u16, String), CoreError> {
+        let client = self.client.read().await;
+        client
+            .get_text(url)
+            .await
+            .map_err(|e| CoreError::ProviderError(e.to_string()))
+    }
+
+    /// 用共享的拟态客户端取任意 URL 的原始字节
+    pub async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, CoreError> {
+        let client = self.client.read().await;
+        client
+            .get_bytes(url)
+            .await
+            .map_err(|e| CoreError::ProviderError(e.to_string()))
+    }
+
     pub async fn reload_config(&self, config: &DsCoreConfig) -> Result<(), CoreError> {
         let client = build_client(config);
         let wasm_bytes = client.get_wasm().await?;

@@ -62,8 +62,8 @@ pub struct OpenAIAdapter {
     model_types: tokio::sync::RwLock<Vec<String>>,
     model_registry: tokio::sync::RwLock<HashMap<String, String>>,
     model_aliases: tokio::sync::RwLock<Vec<String>>,
-    max_input_tokens: tokio::sync::RwLock<Vec<u32>>,
-    max_output_tokens: tokio::sync::RwLock<Vec<u32>>,
+    /// 元数据取值策略 + `model_types` 对齐的配置数组
+    metadata_source: tokio::sync::RwLock<crate::config::DsCoreSection>,
     tag_config: tokio::sync::RwLock<Arc<response::TagConfig>>,
     /// 未显式传 `web_search_options` 时是否默认开启搜索模式
     default_search_enabled: std::sync::atomic::AtomicBool,
@@ -122,8 +122,7 @@ impl OpenAIAdapter {
             model_types: tokio::sync::RwLock::new(config.ds_core.model_types.clone()),
             model_registry: tokio::sync::RwLock::new(model_registry),
             model_aliases: tokio::sync::RwLock::new(config.ds_core.model_aliases.clone()),
-            max_input_tokens: tokio::sync::RwLock::new(config.ds_core.max_input_tokens.clone()),
-            max_output_tokens: tokio::sync::RwLock::new(config.ds_core.max_output_tokens.clone()),
+            metadata_source: tokio::sync::RwLock::new(config.ds_core.clone()),
             tag_config: tokio::sync::RwLock::new(Arc::new(response::TagConfig::from_config(
                 &config.ds_core.tool_call,
             ))),
@@ -312,21 +311,51 @@ impl OpenAIAdapter {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// 对外暴露的模型元数据（token 上限等）
+    ///
+    /// 只有 `input_character_limit` 是上游真实字段；token 上限是实测常量。
+    /// 由 `[ds_core] model_metadata_source` 决定取值策略（见 `resolved_*`）。
+    async fn model_metadata(&self) -> (Vec<u32>, Vec<u32>) {
+        // 先把需要的字段拷出来，读锁不跨后续计算持有
+        let (source, limit, input, output) = {
+            let config = self.metadata_source.read().await;
+            (
+                config.model_metadata_source.clone(),
+                config.model_types.len(),
+                config.max_input_tokens.clone(),
+                config.max_output_tokens.clone(),
+            )
+        };
+        match source.as_str() {
+            // 纯配置驱动：完全按配置里的数组，缺项就回落到实测常量
+            "config" => {
+                let mut input = input;
+                let mut output = output;
+                input.resize(limit, crate::config::MEASURED_MAX_INPUT_TOKENS);
+                output.resize(limit, crate::config::MEASURED_MAX_OUTPUT_TOKENS);
+                (input, output)
+            }
+            // auto（及任何未知值）：实测常量为准，配置值不参与
+            _ => (
+                vec![crate::config::MEASURED_MAX_INPUT_TOKENS; limit],
+                vec![crate::config::MEASURED_MAX_OUTPUT_TOKENS; limit],
+            ),
+        }
+    }
+
     /// GET /v1/models
     pub async fn list_models(&self) -> types::OpenAIModelList {
         let model_types = self.model_types.read().await;
-        let max_input = self.max_input_tokens.read().await;
-        let max_output = self.max_output_tokens.read().await;
         let aliases = self.model_aliases.read().await;
+        let (max_input, max_output) = self.model_metadata().await;
         models::list(&model_types, &max_input, &max_output, &aliases)
     }
 
     /// GET /v1/models/{model_id}
     pub async fn get_model(&self, model_id: &str) -> Option<types::OpenAIModel> {
         let model_types = self.model_types.read().await;
-        let max_input = self.max_input_tokens.read().await;
-        let max_output = self.max_output_tokens.read().await;
         let aliases = self.model_aliases.read().await;
+        let (max_input, max_output) = self.model_metadata().await;
         models::get(&model_types, &max_input, &max_output, &aliases, model_id)
     }
 
@@ -382,6 +411,12 @@ impl OpenAIAdapter {
     }
 
     /// 获取 ds_core 账号池状态
+    /// 暴露底层 `DsCore`（OTA 等需要复用拟态客户端 + 代理的辅助请求）
+    #[must_use]
+    pub const fn ds_core(&self) -> &Arc<DsCore> {
+        &self.ds_core
+    }
+
     pub fn account_statuses(&self) -> Vec<ds_core::AccountStatus> {
         self.ds_core.account_statuses()
     }
@@ -534,8 +569,7 @@ impl OpenAIAdapter {
         *self.model_registry.write().await = registry;
         *self.model_types.write().await = new_config.ds_core.model_types.clone();
         *self.model_aliases.write().await = new_config.ds_core.model_aliases.clone();
-        *self.max_input_tokens.write().await = new_config.ds_core.max_input_tokens.clone();
-        *self.max_output_tokens.write().await = new_config.ds_core.max_output_tokens.clone();
+        *self.metadata_source.write().await = new_config.ds_core.clone();
         *self.tag_config.write().await = Arc::new(response::TagConfig::from_config(
             &new_config.ds_core.tool_call,
         ));

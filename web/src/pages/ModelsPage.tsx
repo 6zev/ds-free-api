@@ -98,7 +98,7 @@ function ModelCard({ model }: { model: ModelInfo }) {
               <span className="truncate">{t('models.contextWindow')}</span>
             </div>
             <div className="font-semibold text-sm font-mono text-foreground truncate">
-              {formatTokens(model.max_input_tokens || model.context_length || 1048576)}
+              {formatTokens(model.max_input_tokens || model.context_length)}
             </div>
           </div>
 
@@ -108,7 +108,7 @@ function ModelCard({ model }: { model: ModelInfo }) {
               <span className="truncate">{t('models.maxOutput')}</span>
             </div>
             <div className="font-semibold text-sm font-mono text-foreground truncate">
-              {formatTokens(model.max_output_tokens || 384000)}
+              {formatTokens(model.max_output_tokens || 0)}
             </div>
           </div>
         </div>

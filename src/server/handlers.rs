@@ -172,6 +172,8 @@ pub(crate) struct AppState {
     pub(crate) config_path: PathBuf,
     /// `Idempotency-Key` 缓存（进程内，有界 + TTL）
     pub(crate) idempotency: Arc<IdempotencyStore>,
+    /// OTA 自更新运行时状态
+    pub(crate) update_status: Arc<super::admin::UpdateState>,
 }
 struct RequestRecord<'a> {
     request_id: &'a str,

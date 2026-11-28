@@ -4,6 +4,61 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.0] - 2026-11-28
+
+### 修复：真实账号下正文仍被截断（只剩首片 1–5 个字，`finish_reason` 是 `stop`）
+
+- **根因**（2026-11-28 真实账号逐帧复现）：新会话首个快照只含 `THINK` 片段，之后
+  上游用 `fragments` 的 `o:"SET"` 存入一个 **`RESPONSE` 首片**，紧接着**直接**下发裸
+  `{"v":"…"}` 增量 —— 中间**没有** `fragments/-1/content` 的 `o:"APPEND"`。
+  这类裸帧没有 `p`/`o`，粘滞路径为空，旧实现把它当作「无路径 SET」整帧丢弃，于是
+  正文只剩首片（`## `、`杭州` 之类），而 `FINISHED` 状态让适配层照常上报
+  `finish_reason: "stop"`。`v0.6.5` 修的 `fragments` SET 增长分支不覆盖这种形态。
+- **改动**：在 `PatchState::apply_frame` 解析出的 JSON 上补一层归一化 —— 当一帧同时
+  满足「无 `p`」「无 `o`」「`v` 是字符串」「粘滞路径为空或已经是
+  `response/fragments/-1/content`」「当前已有片段」时，改写为
+  `{"p":"response/fragments/-1/content","o":"APPEND","v":…}` 再交给 `apply_patch`。
+  真实协议里 THINK 到 `RESPONSE` 的切换都伴随 `fragments` SET，所以「已有片段」这一
+  条件是安全的；不带 `p`/`o` 的 BATCH 以数组形态出现，不会是字符串。
+- 新增回归：`bare_delta_after_snapshot_appends_to_last_fragment`（真实账号抓包序列）。
+- 真实账号 E2E 验证：OpenAI 流式 1820 字、Anthropic 流式（含后续片段）与
+  Responses API 均完整收尾。
+
+### 新增：在线更新（OTA）
+
+- 新增 `[update]` 配置段（`enabled`、`repository`、`api_base`、`channel`、
+  `check_interval_hours`），默认关闭；开启后管理面板「设置」页出现「版本与更新」卡片，
+  展示当前版本、远端最新版本、发布时间与更新说明。
+- 新增 `src/self_update/`（纯 I/O，无业务逻辑）：按 `deploy_id()` 选产物
+  （`ds-free-api-vX.Y.Z-<platform>.tar.gz` / `.zip`），校验同一 Release 的
+  `SHA256SUMS`，内存内解包 → 写 `<bin>.new` → `chmod 755` → 备份 `<bin>.old` →
+  原子 `rename`。任一步失败都保留原二进制；`rollback()` 可回退，`cleanup()` 在启动时
+  清理残留。
+- 新增管理端点 `GET /admin/api/update`（状态）、`POST /admin/api/update/check`、
+  `POST /admin/api/update/apply`（已有任务时返回 `409`）。替换二进制后需重启进程生效。
+- 下载走 `ds_core` 的拟态客户端（`DsCore::fetch_text` / `fetch_bytes`），因此沿用
+  `[proxy]` 与 TLS/HTTP2 指纹配置。
+- **安全边界**：`SHA256SUMS` 与产物来自同一个 Release —— 它只能保证传输完整，
+  不能替代签名验证；只应从可信仓库开启此功能。
+
+### 新增：`model_metadata_source` — 模型元数据来源可切换
+
+- 新增 `[ds_core] model_metadata_source`（`auto` 默认 / `config`）：
+  - `auto`：上游 `/api/v0/client/settings` 返回的值优先；
+  - `config`：完全使用本地配置（适合上游字段缺失或需要固定展示的场景）。
+- 只有 `input_character_limit` 是上游真实值（当前 `2621440`）；`max_input_tokens`
+  与 `max_output_tokens` 是**实测常量**（`1048576` / `384000`），已在
+  `config.example.toml` 中注明。
+
+### 改进：模型页与 `/v1/models` 只暴露一个真实模型
+
+- 单一 `model_type = default` 时，`/v1/models` 与 Anthropic 模型列表返回
+  `deepseek-default` 与裸名 `default` 两个 ID（后者供 Claude Code / Codex 使用），
+  不再出现仓库里写死的附加条目。
+- `web/src/pages/ModelsPage.tsx` 的元数据缺失回退改为读取后端返回的真实字段，
+  不再显示占位值。
+- `MODEL_OWNED_BY` 更新为 `deepseek-web (proxied by https://github.com/NIyueeE)`。
+
 ## [0.6.5] - 2026-11-27
 
 ### 修复：流式回答被截断（客户端只收到开头几个字，`finish_reason` 却是 `stop`）

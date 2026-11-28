@@ -20,10 +20,14 @@ const MODEL_OWNED_BY: &str = "deepseek-web (proxied by https://github.com/NIyuee
 
 /// 枚举全部可用的模型 ID（按展示顺序），值为 `model_types` 中的下标
 ///
-/// 每个 `model_type` 会产生多个别名写法，便于客户端用不同约定引用同一模型：
-/// - `deepseek-{ty}`（标准 ID）
+/// 每个 `model_type` 只产生两种写法 —— 这是**唯一**可对外承诺的模型集合，
+/// 不再重复堆叠 `deepseek-deepseek-x` 之类的派生别名：
+/// - `deepseek-{ty}`（标准 OpenAI `provider-model` 形式）
 /// - `{ty}`（裸 model_type 名；Claude Code / Codex 依赖此写法，见 issue #99）
-/// - `model_aliases[i]`（用户自定义别名，可选）
+/// - `model_aliases[i]`（用户自定义别名，可选，管理员显式配置才出现）
+///
+/// 默认配置只有一个 `model_type`（`default`），于是 `/v1/models` 恰好两条：
+/// `deepseek-default` + `default` —— 同一个模型的两个可接受拼写，不是两个模型。
 ///
 /// `deepseek-{ty}` 与 `{ty}` 在忽略大小写后可能相同（例如 `ty = "DeepSeek-X"`），
 /// 因此这里做去重，保证列表内 ID 唯一。

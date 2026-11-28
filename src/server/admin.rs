@@ -56,6 +56,8 @@ pub struct AdminConfigResponse {
     pub server: ServerConfigView,
     pub ds_core: DsCoreView,
     pub proxy: ProxyConfigView,
+    /// OTA 自更新配置（对应 `[update]`）
+    pub update: UpdateView,
     pub admin: AdminConfigView,
     pub api_keys: Vec<ApiKeyEntryView>,
 }
@@ -107,6 +109,23 @@ pub struct DsCoreView {
     pub responses_store_capacity: usize,
     /// Responses API 上下文缓存存活秒数
     pub responses_store_ttl_secs: u64,
+    /// 模型元数据来源：`auto`（实测常量）或 `config`（按配置数组）
+    pub model_metadata_source: String,
+}
+
+#[derive(Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "管理面板往返 JSON 必须逐字段平铺，与 TOML 段一一对应"
+)]
+pub struct UpdateView {
+    pub enabled: bool,
+    pub check_on_startup: bool,
+    pub allow_apply: bool,
+    pub repo: String,
+    pub use_latest: bool,
+    pub target_tag: String,
+    pub api_base: String,
 }
 
 #[derive(Serialize)]
@@ -202,6 +221,16 @@ fn mask_config(config: &Config) -> AdminConfigResponse {
             default_search_enabled: config.ds_core.default_search_enabled,
             responses_store_capacity: config.ds_core.responses_store_capacity,
             responses_store_ttl_secs: config.ds_core.responses_store_ttl_secs,
+            model_metadata_source: config.ds_core.model_metadata_source.clone(),
+        },
+        update: UpdateView {
+            enabled: config.update.enabled,
+            check_on_startup: config.update.check_on_startup,
+            allow_apply: config.update.allow_apply,
+            repo: config.update.repo.clone(),
+            use_latest: config.update.use_latest,
+            target_tag: config.update.target_tag.clone(),
+            api_base: config.update.api_base.clone(),
         },
         proxy: ProxyConfigView {
             url: config.proxy.url.clone(),
@@ -716,4 +745,121 @@ description = "test"
             );
         }
     }
+}
+
+// ── 自更新（OTA）────────────────────────────────────────────────────────────
+
+/// OTA 运行时状态：进程内单例，管理面板从这里读当前进度
+pub(crate) struct UpdateState {
+    status: tokio::sync::RwLock<crate::self_update::UpdateStatus>,
+    /// 同一时间只允许一个更新任务
+    busy: std::sync::atomic::AtomicBool,
+}
+
+impl UpdateState {
+    pub(crate) fn new() -> Self {
+        Self {
+            status: tokio::sync::RwLock::new(crate::self_update::UpdateStatus::Idle),
+            busy: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct UpdateInfoResponse {
+    pub current: String,
+    pub deploy_id: String,
+    pub enabled: bool,
+    pub status: crate::self_update::UpdateStatus,
+}
+
+/// GET /admin/api/update — 当前版本 + 最近一次检查/更新的状态
+pub(crate) async fn admin_update_info(State(state): State<AppState>) -> Response {
+    let status = state.update_status.status.read().await.clone();
+    let config = state.config.read().await;
+    json_response(&UpdateInfoResponse {
+        current: env!("CARGO_PKG_VERSION").to_string(),
+        deploy_id: crate::self_update::deploy_id(),
+        enabled: config.update.enabled,
+        status,
+    })
+}
+
+/// POST /admin/api/update/check — 只查询 GitHub Releases，不改动任何东西
+pub(crate) async fn admin_update_check(State(state): State<AppState>) -> Response {
+    let update_cfg = state.config.read().await.update.clone();
+    let current = env!("CARGO_PKG_VERSION");
+    match crate::self_update::check(state.adapter.ds_core(), &update_cfg, current).await {
+        Ok(view) => {
+            *state.update_status.status.write().await = view.status.clone();
+            json_response(&view)
+        }
+        Err(e) => {
+            let status = crate::self_update::UpdateStatus::Failed {
+                latest: None,
+                error: e.clone(),
+                at: crate::self_update::now_secs(),
+            };
+            *state.update_status.status.write().await = status.clone();
+            error_response(StatusCode::BAD_GATEWAY, &format!("{e} ({status:?})"))
+        }
+    }
+}
+
+/// POST /admin/api/update/apply — 下载 + 校验 + 替换二进制，需要重启生效
+pub(crate) async fn admin_update_apply(State(state): State<AppState>) -> Response {
+    use std::sync::atomic::Ordering;
+
+    if state.update_status.busy.swap(true, Ordering::AcqRel) {
+        return error_response(StatusCode::CONFLICT, "已有更新任务在进行中");
+    }
+    let result = run_apply(state.clone()).await;
+    state.update_status.busy.store(false, Ordering::Release);
+
+    match result {
+        Ok(status) => {
+            *state.update_status.status.write().await = status.clone();
+            json_response(&serde_json::json!({
+                "status": status,
+                "restart_required": true,
+            }))
+        }
+        Err(e) => {
+            *state.update_status.status.write().await = crate::self_update::UpdateStatus::Failed {
+                latest: None,
+                error: e.clone(),
+                at: crate::self_update::now_secs(),
+            };
+            error_response(StatusCode::BAD_GATEWAY, &e)
+        }
+    }
+}
+
+/// 实际执行：检查 → 下载 → 校验 → 替换，并逐步写入状态供 UI 轮询
+async fn run_apply(state: AppState) -> Result<crate::self_update::UpdateStatus, String> {
+    let update_cfg = {
+        let config = state.config.read().await;
+        if !config.update.enabled {
+            return Err("[update] enabled = false，管理面板未开启自更新".to_string());
+        }
+        if !config.update.allow_apply {
+            return Err("[update] allow_apply = false，只允许检查不允许应用".to_string());
+        }
+        config.update.clone()
+    };
+    let current = env!("CARGO_PKG_VERSION");
+    let view = crate::self_update::check(state.adapter.ds_core(), &update_cfg, current).await?;
+    if !view.update_available {
+        return Err(format!("当前版本 {current} 已是最新（{}）", view.latest));
+    }
+    let (Some(latest), Some(asset)) = (Some(view.latest.clone()), view.asset.clone()) else {
+        return Err("最新版本缺少本平台产物".to_string());
+    };
+    *state.update_status.status.write().await = crate::self_update::UpdateStatus::Downloading {
+        latest: latest.clone(),
+        asset,
+    };
+
+    let bin = crate::self_update::current_exe()?;
+    crate::self_update::download_and_apply(state.adapter.ds_core(), &update_cfg, &view, &bin).await
 }

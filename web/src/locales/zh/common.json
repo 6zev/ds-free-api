@@ -204,7 +204,17 @@
     "autoResumeDesc": "上游截断长思考时自动续写。",
     "autoResumeAttemptsLabel": "最大续写次数",
     "autoResumeAttemptsDesc": "单次请求最多触发几轮续写。",
-    "loginEncryptionDesc": "对 /api/v0/users/* 的 POST（含登录）按官方客户端加密。"
+    "loginEncryptionDesc": "对 /api/v0/users/* 的 POST（含登录）按官方客户端加密。",
+    "otaTitle": "系统更新（OTA）",
+    "otaDesc": "从 GitHub Releases 检查并应用新版本：下载本机产物 → SHA256 校验 → 原子替换二进制。替换后需重启进程生效。",
+    "otaAllowApplyDesc": "关闭后只允许检查，不允许下载与替换。",
+    "otaCheck": "检查更新",
+    "otaApply": "下载并替换",
+    "otaApplying": "正在下载…",
+    "otaRestartHint": "替换完成后请重启服务（systemd / docker restart / 手动），新版本才会生效。",
+    "updateAvailable": "发现新版本 {{latest}}，可下载应用。",
+    "updateUpToDate": "当前版本 {{current}} 已是最新。",
+    "updateReady": "已替换二进制，重启服务后生效。"
   },
   "logs": {
     "title": "日志",

@@ -204,7 +204,17 @@
     "autoResumeDesc": "Lanjutkan generasi otomatis saat upstream memotong giliran berpikir panjang.",
     "autoResumeAttemptsLabel": "Batas percobaan lanjut",
     "autoResumeAttemptsDesc": "Berapa kali lanjutan boleh dipicu per permintaan.",
-    "loginEncryptionDesc": "Enkripsi body POST /api/v0/users/* (termasuk login) seperti klien resmi."
+    "loginEncryptionDesc": "Enkripsi body POST /api/v0/users/* (termasuk login) seperti klien resmi.",
+    "otaTitle": "Pembaruan sistem (OTA)",
+    "otaDesc": "Periksa GitHub Releases dan terapkan versi baru: unduh aset platform ini → verifikasi SHA256 → ganti biner secara atomik. Perlu restart proses.",
+    "otaAllowApplyDesc": "Jika dimatikan, hanya pemeriksaan yang diizinkan — tanpa unduh atau ganti.",
+    "otaCheck": "Periksa pembaruan",
+    "otaApply": "Unduh & ganti",
+    "otaApplying": "Mengunduh…",
+    "otaRestartHint": "Restart layanan setelah penggantian (systemd / docker restart / manual) agar versi baru berlaku.",
+    "updateAvailable": "Versi baru {{latest}} tersedia.",
+    "updateUpToDate": "{{current}} sudah versi terbaru.",
+    "updateReady": "Biner telah diganti — restart layanan untuk menerapkan."
   },
   "logs": {
     "title": "Log",

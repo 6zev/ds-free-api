@@ -187,6 +187,16 @@ export interface AccountEntry {
   device_id?: string;
 }
 
+export interface UpdateConfig {
+  enabled: boolean;
+  check_on_startup: boolean;
+  allow_apply: boolean;
+  repo: string;
+  use_latest: boolean;
+  target_tag: string;
+  api_base: string;
+}
+
 export interface DsCoreConfig {
   accounts: AccountEntry[];
   api_base: string;
@@ -224,6 +234,8 @@ export interface DsCoreConfig {
   login_encryption: boolean;
   responses_store_capacity: number;
   responses_store_ttl_secs: number;
+  /** 'auto' = measured constants; 'config' = use max_input_tokens / max_output_tokens */
+  model_metadata_source: string;
 }
 
 export interface ProxyConfig {
@@ -256,6 +268,7 @@ export interface FullConfig {
   server: ServerConfig;
   ds_core: DsCoreConfig;
   proxy: ProxyConfig;
+  update: UpdateConfig;
   admin: AdminConfigResponse;
   api_keys: ApiKeyEntry[];
 }
@@ -285,6 +298,14 @@ const DEFAULTS = {
   maxInputTokens: 1048576,
   maxOutputTokens: 384000,
   maxChars: 2621440,
+  updateEnabled: false,
+  updateCheckOnStartup: false,
+  updateAllowApply: true,
+  updateRepo: '6zev/ds-free-api',
+  updateUseLatest: true,
+  updateTargetTag: '',
+  updateApiBase: 'https://api.github.com',
+  modelMetadataSource: 'auto',
   responsesStoreCapacity: 256,
   responsesStoreTtlSecs: 3600,
   defaultSearchEnabled: false,
@@ -386,10 +407,31 @@ export function normalizeConfig(raw: any): FullConfig {
         core.responses_store_capacity ?? DEFAULTS.responsesStoreCapacity,
       responses_store_ttl_secs:
         core.responses_store_ttl_secs ?? DEFAULTS.responsesStoreTtlSecs,
+      model_metadata_source:
+        core.model_metadata_source ?? DEFAULTS.modelMetadataSource,
     },
     proxy: {
       url: raw.proxy?.url ?? null,
       bypass_hosts: raw.proxy?.bypass_hosts ?? [],
+    },
+    update: {
+      enabled:
+        typeof raw.update?.enabled === 'boolean' ? raw.update.enabled : DEFAULTS.updateEnabled,
+      check_on_startup:
+        typeof raw.update?.check_on_startup === 'boolean'
+          ? raw.update.check_on_startup
+          : DEFAULTS.updateCheckOnStartup,
+      allow_apply:
+        typeof raw.update?.allow_apply === 'boolean'
+          ? raw.update.allow_apply
+          : DEFAULTS.updateAllowApply,
+      repo: raw.update?.repo ?? DEFAULTS.updateRepo,
+      use_latest:
+        typeof raw.update?.use_latest === 'boolean'
+          ? raw.update.use_latest
+          : DEFAULTS.updateUseLatest,
+      target_tag: raw.update?.target_tag ?? DEFAULTS.updateTargetTag,
+      api_base: raw.update?.api_base ?? DEFAULTS.updateApiBase,
     },
     admin: {
       password_set: raw.admin?.password_set ?? true,
@@ -497,4 +539,55 @@ export function localizeAuthError(msg?: string, lang?: string): string {
   }
 
   return msg;
+}
+
+// ── OTA 自更新 ────────────────────────────────────────────────────────────
+
+export type UpdateStatus =
+  | { state: 'idle' }
+  | {
+      state: 'checked';
+      latest: string;
+      current: string;
+      update_available: boolean;
+      asset: string | null;
+      notes: string | null;
+      checked_at: number;
+    }
+  | { state: 'downloading'; latest: string; asset: string }
+  | { state: 'ready'; latest: string; asset: string; backup: string }
+  | { state: 'failed'; latest: string | null; error: string; at: number };
+
+export interface UpdateInfo {
+  current: string;
+  deploy_id: string;
+  enabled: boolean;
+  status: UpdateStatus;
+}
+
+export interface UpdateCheckResult {
+  current: string;
+  latest: string;
+  update_available: boolean;
+  asset: string | null;
+  download_url: string | null;
+  notes: string | null;
+  published_at: string | null;
+  deploy_id: string;
+  status: UpdateStatus;
+}
+
+export async function apiUpdateInfo(): Promise<UpdateInfo> {
+  return apiFetch<UpdateInfo>('/admin/api/update');
+}
+
+export async function apiUpdateCheck(): Promise<UpdateCheckResult> {
+  return apiFetch<UpdateCheckResult>('/admin/api/update/check', { method: 'POST' });
+}
+
+export async function apiUpdateApply(): Promise<{
+  status: UpdateStatus;
+  restart_required: boolean;
+}> {
+  return apiFetch('/admin/api/update/apply', { method: 'POST' });
 }

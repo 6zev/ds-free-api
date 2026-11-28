@@ -303,8 +303,28 @@ impl PatchState {
 
         // 解析 data JSON
         if let Some(data) = data
-            && let Ok(val) = serde_json::from_str::<serde_json::Value>(data)
+            && let Ok(mut val) = serde_json::from_str::<serde_json::Value>(data)
         {
+            // 无 p/o 的 `{"v":…}` 增量沿用上一条的路径；若上一条本就无 p/o，
+            // 粘滞路径为空。此时值为字符串说明这是**同一片段**的下一段正文，
+            // 按 `fragments/-1/content` APPEND 处理（2026-11-28 实测：新会话首答
+            // 初始快照后上游直接下发 `{"v":"…"}`，正文因此在首片后全部丢失）。
+            if let Some(obj) = val.as_object()
+                && !obj.contains_key("p")
+                && !obj.contains_key("o")
+                && obj.get("v").is_some_and(serde_json::Value::is_string)
+                && matches!(
+                    self.sticky_path.as_deref(),
+                    None | Some("" | "response/fragments/-1/content")
+                )
+                && !self.fragments.is_empty()
+            {
+                val = serde_json::json!({
+                    "p": "response/fragments/-1/content",
+                    "o": "APPEND",
+                    "v": obj.get("v").cloned().unwrap_or_default(),
+                });
+            }
             events.extend(self.apply_patch(val));
         }
 
@@ -1543,6 +1563,37 @@ mod tests {
         assert_eq!(content, "Hi!");
         assert!(state.response_has_content);
         assert_eq!(state.status.as_deref(), Some("FINISHED"));
+        assert_eq!(classify_outcome(&state), StreamOutcome::Complete);
+    }
+
+    /// 回归：2026-11-28 真实账号实测 —— 新会话首个快照只含 THINK，随后的
+    /// `fragments` SET（仍只有 THINK）之后，上游**直接**下发 `{"v":"…"}` 裸增量，
+    /// 中间没有 `fragments/-1/content` APPEND。旧实现把裸增量当成无路径 SET 丢掉，
+    /// 只剩首片 `"## "` 的正文、并以 `stop` 收尾（静默截断）。此处必须完整。
+    #[test]
+    fn bare_delta_after_snapshot_appends_to_last_fragment() {
+        let mut state = PatchState::new();
+        let frames = [
+            r#"data: {"v":{"response":{"status":"WIP","fragments":[{"id":2,"type":"THINK","content":"构思中"}]}}}"#,
+            r#"data: {"p":"response/fragments/-1/elapsed_secs","o":"SET","v":1.37}"#,
+            r#"data: {"p":"response/fragments","v":[{"id":2,"type":"THINK","content":"构思中，写六个部分。"}]}"#,
+            "data: {\"p\":\"response/fragments\",\"v\":[{\"id\":2,\"type\":\"THINK\",\"content\":\"构思中\"},{\"id\":3,\"type\":\"RESPONSE\",\"content\":\"## 晨露未干\"},{\"id\":4,\"type\":\"RESPONSE\",\"content\":\"\"}]}",
+            "data: {\"v\":\"\\n\\n天还没全亮透\"}",
+            r#"data: {"p":"response/status","v":"FINISHED"}"#,
+        ];
+        let mut phase = Phase::Init;
+        let mut content = String::new();
+        for frame in frames {
+            let events = state.apply_frame(frame).expect("帧应可解析");
+            let mut out = VecDeque::new();
+            finalize_events(&mut state, &mut phase, events, &mut out);
+            for evt in out {
+                if let StreamEvent::ContentDelta { content: c } = evt {
+                    content.push_str(&c);
+                }
+            }
+        }
+        assert_eq!(content, "## 晨露未干\n\n天还没全亮透");
         assert_eq!(classify_outcome(&state), StreamOutcome::Complete);
     }
 

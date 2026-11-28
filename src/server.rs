@@ -58,6 +58,12 @@ pub async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     let port = config.server.port;
     let responses_store_capacity = config.ds_core.responses_store_capacity;
     let responses_store_ttl_secs = config.ds_core.responses_store_ttl_secs;
+    // 上次 OTA 留下的 `<bin>.old`：新版本已经跑起来（能走到这里），说明替换成功
+    let bin_path = std::env::current_exe().ok();
+    if let Some(bin) = &bin_path {
+        crate::self_update::cleanup(&bin.with_extension("old"));
+    }
+    let startup_update = config.update.clone();
     let adapter = Arc::new(OpenAIAdapter::new(&config).await?);
     let config = Arc::new(tokio::sync::RwLock::new(config));
     let anthropic_compat = Arc::new(AnthropicCompat::new(Arc::clone(&adapter)));
@@ -84,8 +90,33 @@ pub async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         store: store.clone(),
         login_limiter: login_limiter.clone(),
         idempotency: Arc::new(idempotency::IdempotencyStore::new()),
+        update_status: Arc::new(admin::UpdateState::new()),
     };
     let router = build_router(state.clone(), &cors_origins);
+
+    // 启动时按配置检查一次更新（只查不装；结果写到日志 + 管理面板状态里）
+    if startup_update.enabled && startup_update.check_on_startup {
+        let state = state.clone();
+        tokio::spawn(async move {
+            match crate::self_update::check(
+                state.adapter.ds_core(),
+                &startup_update,
+                env!("CARGO_PKG_VERSION"),
+            )
+            .await
+            {
+                Ok(view) if view.update_available => log::info!(
+                    target: "self_update",
+                    "发现新版本 {}（当前 {}，产物 {}）—— 到管理面板「系统更新」应用",
+                    view.latest,
+                    view.current,
+                    view.asset.as_deref().unwrap_or("无")
+                ),
+                Ok(_) => log::debug!(target: "self_update", "启动检查：已是最新版本"),
+                Err(e) => log::warn!(target: "self_update", "启动检查更新失败: {e}"),
+            }
+        });
+    }
 
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr).await?;
@@ -160,6 +191,10 @@ fn build_router(state: AppState, cors_origins: &[String]) -> Router {
         .route("/admin/api/config", get(admin::admin_config))
         // Config
         .route("/admin/api/config", put(admin::admin_put_config))
+        // OTA 自更新
+        .route("/admin/api/update", get(admin::admin_update_info))
+        .route("/admin/api/update/check", post(admin::admin_update_check))
+        .route("/admin/api/update/apply", post(admin::admin_update_apply))
         // Request logs
         .route("/admin/api/logs", get(admin::admin_logs))
         // Runtime logs
