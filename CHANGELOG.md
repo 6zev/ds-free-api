@@ -4,6 +4,50 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.3] - 2026-11-28
+
+### 修复：OTA「下载并替换」一律返回 502
+
+- **根因**：`admin_update_check` / `admin_update_apply` 把所有失败都写成
+  `502 Bad Gateway`，于是「已是最新」「`allow_apply = false`」「没有本平台
+  产物」这些**用户自己能改**的状态也被当成上游故障，面板只显示
+  `API error: 502`，看不出该动哪里。
+- **改动**：
+  - 新增 `UpdateErrorKind`（`Rejected` / `Upstream` / `Apply`）与
+    `UpdateError { kind, message }`，`update_error_status` 映射为
+    `409 CONFLICT` / `502 BAD_GATEWAY` / `500 INTERNAL_SERVER_ERROR`；
+    错误 `message` 为中文可执行提示，直接透传给面板。
+  - `run_apply` 增加 `Ready` 守卫：上一轮已替换二进制、只差重启时再次点
+    「下载并替换」会拿旧备份覆盖新二进制（版本号仍是旧的 → 又判定可更新），
+    属于 fix-on-fix，现在直接拒绝并提示重启与备份路径。
+  - `view_from_release`：`update_available` 必须同时满足「有新版本」且
+    「本平台产物存在」，避免前端放行一个后端必然失败的操作。
+  - `ds_core` 的外域请求（GitHub Releases JSON、`SHA256SUMS`、产物下载）
+    增加整体超时（30s / 10min）；拟态头失败时降级为空头 —— 第三方域不看
+    `device_id` 身份头，不该因为没配设备指纹让整个更新流程失败。
+- **前端**：`SettingsPage` 在表单有未保存改动（`isDirty`）时拦截
+  「下载并替换」并提示先保存；按钮 `title` 提示先开启自更新；补
+  `settings.otaSaveFirst` / `settings.otaEnableFirst`（zh / en / id）。
+
+### 新增：`/v1/models` 下发模型元数据
+
+- 只给 `id` + `owned_by` 会让只读元数据的客户端（例如
+  `vscode-unify-chat-provider` 这类实现）把模型当成能力未知，退回通用的
+  128k 输入 / 64k 输出、无视觉、无思考的默认值。
+- `OpenAIModel` 新增 `name`（`DeepSeek Default` / `DeepSeek Vision` /
+  `DeepSeek`）、`capabilities`、`vision`、`reasoning`、`model_type`；
+  `capabilities` 拆成 `input` / `output` 两个子结构并用 `#[serde(flatten)]`
+  铺平，避免 `clippy::struct_excessive_bools`（本项目只允许在
+  `client.rs` 里豁免 lint）。
+- 能力由 `model_type` 推导：只有 `vision` 类型给 `image_input` /
+  `pdf_input`；`thinking` / `tool_calling` / `structured_outputs` 目前为 true。
+- 原有数值字段（`max_input_tokens` / `max_output_tokens` / `context_length` /
+  `context_window` / `max_context_length` / `max_tokens` /
+  `max_completion_tokens`）全部保留：SDK 类客户端读数值，通用客户端读
+  `name` / `capabilities`。
+- Anthropic 层 `display_name` 优先取 `name`，`capabilities` 如实下发而非全
+  `true`；别名与规范 ID 共用同一份元数据。
+
 ## [0.7.2] - 2026-11-28
 
 ### 修复：管理面板添加账号后「账号池」无任何反馈
