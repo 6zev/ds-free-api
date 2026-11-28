@@ -497,6 +497,17 @@ pub struct OpenAIModel {
     pub object: &'static str,
     pub created: u64,
     pub owned_by: &'static str,
+    /// 人读显示名（非 OpenAI 标准字段，但 VS Code 等客户端会读）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 能力开关（工具调用 / 图片 / PDF / 结构化输出 / 思考）
+    pub capabilities: OpenAIModelCapabilities,
+    /// 是否视觉模型（顶层标志，部分客户端只认这个）
+    pub vision: bool,
+    /// 是否推理模型（顶层标志）
+    pub reasoning: bool,
+    /// 模型类型原文：`default` / `expert` / `vision`
+    pub model_type: String,
     /// 输入 token 上限（主字段）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<u32>,
@@ -518,6 +529,43 @@ pub struct OpenAIModel {
     /// 兼容字段：同 max_output_tokens
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u32>,
+}
+
+/// 模型能力开关
+///
+/// OpenAI 的模型对象规范里没有这个结构，但客户端需要它来判断「能不能收图 /
+/// 会不会吐工具调用」。字段名用 `snake_case`，与 Anthropic 兼容层的
+/// `capabilities` 语义一致，客户端按需读取、忽略不认识的键。
+///
+/// 两个布尔按语义分到 `Input` / `Output` 子对象，序列化后仍是客户端期待的
+/// 扁平键（`flat` 把子对象的字段提到同一层），既能避开
+/// `struct_excessive_bools`，又不会改变发给客户端的 JSON 形状。
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenAIModelCapabilities {
+    #[serde(flatten, rename = "input")]
+    pub input: OpenAIModelInputCapabilities,
+    #[serde(flatten, rename = "output")]
+    pub output: OpenAIModelOutputCapabilities,
+}
+
+/// 输入侧能力（客户端据此决定要不要把图片/PDF 塞进来）
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenAIModelInputCapabilities {
+    /// 是否能接收图片输入
+    pub image_input: bool,
+    /// 是否能接收 PDF 输入
+    pub pdf_input: bool,
+}
+
+/// 输出侧能力（客户端据此决定要不要开工具、结构化输出、思考模式）
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenAIModelOutputCapabilities {
+    /// 是否支持工具调用
+    pub tool_calling: bool,
+    /// 是否支持结构化输出（`response_format`）
+    pub structured_outputs: bool,
+    /// 是否支持思考/推理模式
+    pub thinking: bool,
 }
 
 /// 模型列表响应

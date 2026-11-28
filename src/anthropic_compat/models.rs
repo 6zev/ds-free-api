@@ -100,7 +100,9 @@ pub(crate) fn get(list: &OpenAIModelList, model_id: &str) -> Option<AnthropicMod
 // ============================================================================
 
 fn to_anthropic_model(m: &OpenAIModel) -> AnthropicModel {
-    let display_name = id_to_display_name(&m.id);
+    // 显示名以 OpenAI 条目为准（同一份元数据源），缺失时才退回按 ID 推导，
+    // 避免两个协议给出的名字不一致。
+    let display_name = m.name.clone().unwrap_or_else(|| id_to_display_name(&m.id));
 
     AnthropicModel {
         id: m.id.clone(),
@@ -109,17 +111,29 @@ fn to_anthropic_model(m: &OpenAIModel) -> AnthropicModel {
         created_at: unix_to_rfc3339(m.created),
         max_input_tokens: m.max_input_tokens,
         max_tokens: m.max_output_tokens,
+        // 能力开关取自同一条目，声明为 false 的能力如实下发：
+        // 谎报 image_input 会让客户端把图片塞给纯文本模型，直接失败。
         capabilities: ModelCapabilities {
             thinking: ThinkingCapability {
-                supported: true,
+                supported: m.capabilities.output.thinking,
                 types: ThinkingTypes {
-                    enabled: CapabilitySupport { supported: true },
-                    adaptive: CapabilitySupport { supported: true },
+                    enabled: CapabilitySupport {
+                        supported: m.capabilities.output.thinking,
+                    },
+                    adaptive: CapabilitySupport {
+                        supported: m.capabilities.output.thinking,
+                    },
                 },
             },
-            image_input: CapabilitySupport { supported: true },
-            pdf_input: CapabilitySupport { supported: true },
-            structured_outputs: CapabilitySupport { supported: true },
+            image_input: CapabilitySupport {
+                supported: m.capabilities.input.image_input,
+            },
+            pdf_input: CapabilitySupport {
+                supported: m.capabilities.input.pdf_input,
+            },
+            structured_outputs: CapabilitySupport {
+                supported: m.capabilities.output.structured_outputs,
+            },
         },
     }
 }
@@ -212,6 +226,21 @@ mod tests {
                     object: "model",
                     created: 1_090_108_800,
                     owned_by: "x",
+                    name: Some("DeepSeek Default".to_string()),
+                    capabilities: crate::openai_adapter::types::OpenAIModelCapabilities {
+                        input: crate::openai_adapter::types::OpenAIModelInputCapabilities {
+                            image_input: false,
+                            pdf_input: false,
+                        },
+                        output: crate::openai_adapter::types::OpenAIModelOutputCapabilities {
+                            tool_calling: true,
+                            structured_outputs: true,
+                            thinking: true,
+                        },
+                    },
+                    vision: false,
+                    reasoning: true,
+                    model_type: "default".to_string(),
                     max_input_tokens: None,
                     max_output_tokens: None,
                     context_length: None,
@@ -225,6 +254,21 @@ mod tests {
                     object: "model",
                     created: 1_090_108_800,
                     owned_by: "x",
+                    name: Some("DeepSeek Expert".to_string()),
+                    capabilities: crate::openai_adapter::types::OpenAIModelCapabilities {
+                        input: crate::openai_adapter::types::OpenAIModelInputCapabilities {
+                            image_input: false,
+                            pdf_input: false,
+                        },
+                        output: crate::openai_adapter::types::OpenAIModelOutputCapabilities {
+                            tool_calling: true,
+                            structured_outputs: true,
+                            thinking: true,
+                        },
+                    },
+                    vision: false,
+                    reasoning: true,
+                    model_type: "expert".to_string(),
                     max_input_tokens: None,
                     max_output_tokens: None,
                     context_length: None,
@@ -245,8 +289,10 @@ mod tests {
         assert_eq!(resp.data[1].id, "deepseek-expert");
         assert_eq!(resp.data[0].ty, "model");
         assert!(resp.data[0].capabilities.thinking.supported);
-        assert!(resp.data[0].capabilities.image_input.supported);
-        assert!(resp.data[0].capabilities.pdf_input.supported);
+        // 文本模型如实声明不支持图片/PDF，避免客户端把图片塞给纯文本模型
+        assert!(!resp.data[0].capabilities.image_input.supported);
+        assert!(!resp.data[0].capabilities.pdf_input.supported);
+        assert!(resp.data[0].capabilities.structured_outputs.supported);
         assert_eq!(resp.data[0].created_at, "2004-07-18T00:00:00Z");
         assert!(resp.data[0].max_input_tokens.is_none());
     }
@@ -255,7 +301,8 @@ mod tests {
     fn get_finds_existing_model() {
         let info = get(&sample_list(), "deepseek-default").unwrap();
         assert_eq!(info.id, "deepseek-default");
-        assert_eq!(info.display_name, "Deepseek Default");
+        // 显示名优先取 OpenAI 条目的 name，不再按 ID 粗暴首字母大写
+        assert_eq!(info.display_name, "DeepSeek Default");
     }
 
     #[test]

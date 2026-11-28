@@ -2,6 +2,19 @@
 //!
 //! 基于 DeepSeek `model_types` + `model_aliases` 静态生成 OpenAI `/models` 响应。
 //!
+//! # 为什么每个条目都带完整元数据
+//!
+//! 客户端（VS Code 插件、Cherry Studio、Cline 一类）普遍**只按 ID 查自己的内置
+//! 模型库**，库里没有 `deepseek-default` 这种代理私有 ID，于是拿到一份「能力全部
+//! 未知」的模型：上下文窗口退回 128k/64k 默认、视觉标成不支持、thinking 直接消失，
+//! 即便 `/v1/models` 明明写了 `max_input_tokens = 1048576`。
+//!
+//! 这些客户端不会读 `max_input_tokens`/`context_window` 之类的数字字段 —— 它们
+//! 最多读 `name`（显示名）和 `capabilities`（能力开关）。所以这里的策略是
+//! **两条同时给**：既输出数字字段（给 OpenAI 官方 SDK 一类会读的客户端），也输出
+//! `name` 与 `capabilities`（VS Code `vscode-unify-chat-provider` 一类会读的客户端），
+//! 让同一个条目在任何客户端都自带身份，而不依赖对方的内置库。
+//!
 //! # 单一事实来源
 //!
 //! `list()` 与 `get()` 必须对外暴露**完全一致**的模型 ID 集合，否则会出现
@@ -13,7 +26,10 @@
 //!
 //! 现在由一个函数 [`model_ids`] 统一生成有序 ID 列表，`list()` 与 `get()` 共用它。
 
-use crate::openai_adapter::types::{OpenAIModel, OpenAIModelList};
+use crate::openai_adapter::types::{
+    OpenAIModel, OpenAIModelCapabilities, OpenAIModelInputCapabilities, OpenAIModelList,
+    OpenAIModelOutputCapabilities,
+};
 
 const MODEL_CREATED: u64 = 1_090_108_800;
 const MODEL_OWNED_BY: &str = "deepseek-web (proxied by https://github.com/NIyueeE)";
@@ -78,6 +94,7 @@ pub fn list(
         .map(|(id, idx)| {
             make_model(
                 &id,
+                model_type_at(model_types, idx),
                 max_input_tokens.get(idx).copied(),
                 max_output_tokens.get(idx).copied(),
             )
@@ -111,6 +128,7 @@ pub fn get(
     {
         return Some(make_model(
             &canonical,
+            model_type_at(model_types, idx),
             max_input_tokens.get(idx).copied(),
             max_output_tokens.get(idx).copied(),
         ));
@@ -123,17 +141,43 @@ pub fn get(
     let ty = &model_types[idx];
     Some(make_model(
         &format!("deepseek-{ty}"),
+        ty,
         max_input_tokens.get(idx).copied(),
         max_output_tokens.get(idx).copied(),
     ))
 }
 
-fn make_model(id: &str, input: Option<u32>, output: Option<u32>) -> OpenAIModel {
+/// 取某个下标对应的 `model_type`（下标越界返回空串，只影响显示名与能力推断）
+fn model_type_at(model_types: &[String], idx: usize) -> &str {
+    model_types.get(idx).map_or("", String::as_str)
+}
+
+/// 组装单个模型条目
+///
+/// `model_type` 决定推导出来的能力（`vision` 类型才给 image/pdf 输入）与显示名，
+/// 因此同一个 `deepseek-{ty}` 与它的别名会得到**完全相同**的元数据。
+fn make_model(id: &str, model_type: &str, input: Option<u32>, output: Option<u32>) -> OpenAIModel {
+    let vision = model_type.eq_ignore_ascii_case("vision");
     OpenAIModel {
         id: id.to_string(),
         object: "model",
         created: MODEL_CREATED,
         owned_by: MODEL_OWNED_BY,
+        name: Some(display_name(model_type)),
+        capabilities: OpenAIModelCapabilities {
+            input: OpenAIModelInputCapabilities {
+                image_input: vision,
+                pdf_input: vision,
+            },
+            output: OpenAIModelOutputCapabilities {
+                tool_calling: true,
+                structured_outputs: true,
+                thinking: true,
+            },
+        },
+        vision,
+        reasoning: true,
+        model_type: model_type.to_string(),
         max_input_tokens: input,
         max_output_tokens: output,
         context_length: input,
@@ -142,6 +186,20 @@ fn make_model(id: &str, input: Option<u32>, output: Option<u32>) -> OpenAIModel 
         max_tokens: output,
         max_completion_tokens: output,
     }
+}
+
+/// `default` → `DeepSeek Default`，`vision` → `DeepSeek Vision`
+fn display_name(model_type: &str) -> String {
+    if model_type.is_empty() {
+        return "DeepSeek".to_string();
+    }
+    let mut head = String::new();
+    let mut chars = model_type.chars();
+    if let Some(first) = chars.next() {
+        head.extend(first.to_uppercase());
+        head.push_str(chars.as_str());
+    }
+    format!("DeepSeek {head}")
 }
 
 #[cfg(test)]
@@ -272,6 +330,63 @@ mod tests {
         let unique: std::collections::HashSet<String> =
             ids.iter().map(|(id, _)| id.to_lowercase()).collect();
         assert_eq!(ids.len(), unique.len(), "ID 列表必须无重复：{ids:?}");
+    }
+
+    #[test]
+    fn entries_carry_display_name_and_capabilities() {
+        let (mi, mo) = limits();
+        let list = list(&types(), &mi, &mo, &[]);
+        let default = list
+            .data
+            .iter()
+            .find(|m| m.id == "deepseek-default")
+            .unwrap();
+        assert_eq!(default.name.as_deref(), Some("DeepSeek Default"));
+        assert_eq!(default.model_type, "default");
+        assert!(default.capabilities.output.tool_calling);
+        assert!(default.capabilities.output.thinking);
+        assert!(default.capabilities.output.structured_outputs);
+        assert!(!default.vision);
+        assert!(!default.capabilities.input.image_input);
+    }
+
+    #[test]
+    fn vision_type_declares_image_input() {
+        let types = vec!["vision".to_string()];
+        let (mi, mo) = (vec![100u32], vec![10u32]);
+        let model = get(&types, &mi, &mo, &[], "deepseek-vision").unwrap();
+        assert_eq!(model.name.as_deref(), Some("DeepSeek Vision"));
+        assert!(model.vision);
+        assert!(model.capabilities.input.image_input);
+        assert!(model.capabilities.input.pdf_input);
+    }
+
+    #[test]
+    fn alias_reuses_base_model_metadata() {
+        let (mi, mo) = limits();
+        let aliases = vec!["my-model".to_string()];
+        // 别名按 index 对齐 model_types，这里别名落在 default 上
+        let base = get(&types(), &mi, &mo, &aliases, "deepseek-default").unwrap();
+        let alias = get(&types(), &mi, &mo, &aliases, "my-model").unwrap();
+        assert_eq!(alias.name, base.name);
+        assert_eq!(alias.model_type, base.model_type);
+        assert_eq!(
+            alias.capabilities.input.image_input,
+            base.capabilities.input.image_input
+        );
+    }
+
+    #[test]
+    fn serialized_entry_exposes_name_and_capabilities() {
+        let (mi, mo) = limits();
+        let model = get(&types(), &mi, &mo, &[], "deepseek-default").unwrap();
+        let json = serde_json::to_value(&model).unwrap();
+        assert_eq!(json["name"], "DeepSeek Default");
+        assert_eq!(json["capabilities"]["tool_calling"], true);
+        assert_eq!(json["capabilities"]["image_input"], false);
+        assert_eq!(json["vision"], false);
+        assert_eq!(json["reasoning"], true);
+        assert_eq!(json["model_type"], "default");
     }
 
     #[test]
