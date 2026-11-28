@@ -249,6 +249,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn update_error_kinds_drive_status_codes() {
+        // 分类是「502 满天飞」这次修复的核心：只有真正的外部依赖故障能算 502，
+        // 业务拒绝必须是 4xx，本地写盘失败必须是 5xx 而不是网关错误。
+        use crate::server::update_error_status;
+        assert_eq!(
+            update_error_status(UpdateErrorKind::Rejected),
+            axum::http::StatusCode::CONFLICT
+        );
+        assert_eq!(
+            update_error_status(UpdateErrorKind::Upstream),
+            axum::http::StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            update_error_status(UpdateErrorKind::Apply),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn already_latest_is_a_rejection_not_an_upstream_failure() {
+        let err = UpdateError::rejected("当前版本 0.7.2 已是最新，无需更新");
+        assert_eq!(err.kind, UpdateErrorKind::Rejected);
+        assert_eq!(err.to_string(), "当前版本 0.7.2 已是最新，无需更新");
+    }
+
+    #[test]
+    fn view_flags_missing_platform_asset_as_not_available() {
+        // release 比当前新，但没有本平台产物 → update_available 必须为 false，
+        // 否则前端会放行「下载并替换」，后端再报「没有本平台产物」。
+        let rel = Release {
+            tag_name: "v9.9.9".into(),
+            body: None,
+            published_at: None,
+            assets: vec![ReleaseAsset {
+                name: "ds-free-api-v9.9.9-plan9-sparc.tar.gz".into(),
+                browser_download_url: "https://example.invalid/a.tar.gz".into(),
+                size: 1,
+            }],
+        };
+        let view = view_from_release(&rel, "0.7.2");
+        assert!(is_newer("0.7.2", &rel.tag_name));
+        assert!(!view.update_available);
+        assert!(view.asset.is_none());
+        assert!(view.download_url.is_none());
+    }
+
+    #[test]
     fn parses_versions_and_orders_them() {
         assert_eq!(parse_version("v0.6.10"), Some((0, 6, 10)));
         assert_eq!(parse_version("0.7"), Some((0, 7, 0)));
@@ -389,6 +436,56 @@ pub struct UpdateCheckView {
     pub status: UpdateStatus,
 }
 
+/// OTA 失败分类 —— 决定管理面板该回什么 HTTP 状态码
+///
+/// 之前所有失败都被压成 `502 Bad Gateway`，于是「已是最新」「allow_apply=false」
+/// 这种纯业务状态也被当成上游故障，前端只能显示一句 `API error: 502`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateErrorKind {
+    /// 功能未开启 / 配置不允许 / 已是最新 / 没有本平台产物 —— 4xx，用户能自己改
+    Rejected,
+    /// 真正的外部依赖故障：GitHub 不可达、非 2xx、JSON 解析失败、下载失败
+    Upstream,
+    /// 本地失败：解压 / 写盘 / 替换二进制
+    Apply,
+}
+
+/// OTA 失败：`kind` 决定状态码，`message` 直接给用户看（中文、可执行）
+#[derive(Debug, Clone)]
+pub struct UpdateError {
+    pub kind: UpdateErrorKind,
+    pub message: String,
+}
+
+impl UpdateError {
+    fn rejected(message: impl Into<String>) -> Self {
+        Self {
+            kind: UpdateErrorKind::Rejected,
+            message: message.into(),
+        }
+    }
+
+    fn upstream(message: impl Into<String>) -> Self {
+        Self {
+            kind: UpdateErrorKind::Upstream,
+            message: message.into(),
+        }
+    }
+
+    fn apply(message: impl Into<String>) -> Self {
+        Self {
+            kind: UpdateErrorKind::Apply,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// GitHub API 上的 release 对象 URL
 fn release_path(update: &crate::config::UpdateSection) -> String {
     let repo = update.repo.trim().trim_matches('/');
@@ -406,31 +503,40 @@ fn release_path(update: &crate::config::UpdateSection) -> String {
     }
 }
 
-/// 查一次最新 release 并解析出本平台产物
-pub async fn check(
+/// 拉一次 release JSON 并解析（`check` 与 `apply` 共用，避免重复请求）
+async fn fetch_release(
     core: &ds_core::DsCore,
     update: &crate::config::UpdateSection,
-    current: &str,
-) -> Result<UpdateCheckView, String> {
+) -> Result<Release, UpdateError> {
     let url = release_path(update);
     let (status, body) = core
         .fetch_text(&url)
         .await
-        .map_err(|e| format!("请求 GitHub 失败: {e}"))?;
+        .map_err(|e| UpdateError::upstream(format!("请求 GitHub 失败（{url}）: {e}")))?;
     if !(200..300).contains(&status) {
-        return Err(format!(
-            "GitHub 返回 HTTP {status}: {}",
+        let hint = match status {
+            403 | 429 => "（可能是 GitHub API 速率限制或代理被拒）",
+            404 => "（仓库或 release 不存在，检查 update.repo / target_tag）",
+            _ => "",
+        };
+        return Err(UpdateError::upstream(format!(
+            "GitHub 返回 HTTP {status}{hint}: {}",
             body.chars().take(200).collect::<String>()
-        ));
+        )));
     }
-    let release: Release =
-        serde_json::from_str(&body).map_err(|e| format!("解析 release JSON 失败: {e}"))?;
+    serde_json::from_str(&body)
+        .map_err(|e| UpdateError::upstream(format!("解析 release JSON 失败: {e}")))
+}
+
+/// 把一次 release 解析结果包装成对外视图
+fn view_from_release(release: &Release, current: &str) -> UpdateCheckView {
     let deploy = deploy_id();
     let asset = release.asset_for(&deploy);
     let latest = release.tag_name.clone();
-    Ok(UpdateCheckView {
+    let update_available = is_newer(current, &latest) && asset.is_some();
+    UpdateCheckView {
         current: current.to_string(),
-        update_available: is_newer(current, &latest),
+        update_available,
         latest: latest.clone(),
         asset: asset.map(|a| a.name.clone()),
         download_url: asset.map(|a| a.browser_download_url.clone()),
@@ -440,38 +546,54 @@ pub async fn check(
         status: UpdateStatus::Checked {
             latest,
             current: current.to_string(),
-            update_available: asset.is_some() && is_newer(current, &release.tag_name),
+            update_available,
             asset: asset.map(|a| a.name.clone()),
             notes: release.body.clone(),
             checked_at: now_secs(),
         },
-    })
+    }
+}
+
+/// 查一次最新 release 并解析出本平台产物
+pub async fn check(
+    core: &ds_core::DsCore,
+    update: &crate::config::UpdateSection,
+    current: &str,
+) -> Result<UpdateCheckView, UpdateError> {
+    let release = fetch_release(core, update).await?;
+    Ok(view_from_release(&release, current))
 }
 
 /// 下载 + 校验 + 原子替换当前可执行文件
 ///
 /// 返回替换完成后应写回的状态（`Ready`）。**不做重启** —— 重启策略由调用方决定
 /// （CLI 进程退出让 systemd / docker 拉起，或由管理面板提示用户）。
+///
+/// 只发两次 release API 请求中的**一次**：`view` 里的 `download_url` 与资产名已经
+/// 足够定位产物，校验和从同一次 release 里取，不再重查 JSON。
 pub async fn download_and_apply(
     core: &ds_core::DsCore,
     update: &crate::config::UpdateSection,
     view: &UpdateCheckView,
     bin_path: &Path,
-) -> Result<UpdateStatus, String> {
+) -> Result<UpdateStatus, UpdateError> {
     let (Some(asset_name), Some(url)) = (view.asset.clone(), view.download_url.clone()) else {
-        return Err(format!(
+        return Err(UpdateError::rejected(format!(
             "最新版本 {} 没有本平台（{}）的产物",
             view.latest, view.deploy_id
-        ));
+        )));
     };
     if !view.update_available {
-        return Err(format!("当前版本 {} 已是最新，无需更新", view.current));
+        return Err(UpdateError::rejected(format!(
+            "当前版本 {} 已是最新，无需更新",
+            view.current
+        )));
     }
 
     let archive = core
         .fetch_bytes(&url)
         .await
-        .map_err(|e| format!("下载产物失败: {e}"))?;
+        .map_err(|e| UpdateError::upstream(format!("下载产物失败: {e}")))?;
     let expected = match update_checksum(core, update).await {
         Ok(sums) => find_checksum(&sums, &asset_name),
         Err(e) => {
@@ -483,12 +605,14 @@ pub async fn download_and_apply(
     if let Some(expected) = expected {
         let actual = sha256_hex(&archive);
         if actual != expected {
-            return Err(format!("SHA256 校验失败: 期望 {expected}，实际 {actual}"));
+            return Err(UpdateError::upstream(format!(
+                "SHA256 校验失败: 期望 {expected}，实际 {actual}"
+            )));
         }
     }
 
-    let binary = extract_binary(&asset_name, &archive)?;
-    let backup = apply_binary(bin_path, &binary)?;
+    let binary = extract_binary(&asset_name, &archive).map_err(UpdateError::apply)?;
+    let backup = apply_binary(bin_path, &binary).map_err(UpdateError::apply)?;
     Ok(UpdateStatus::Ready {
         latest: view.latest.clone(),
         asset: asset_name,
@@ -501,16 +625,7 @@ async fn update_checksum(
     core: &ds_core::DsCore,
     update: &crate::config::UpdateSection,
 ) -> Result<String, String> {
-    let url = release_path(update);
-    let (status, body) = core
-        .fetch_text(&url)
-        .await
-        .map_err(|e| format!("请求 GitHub 失败: {e}"))?;
-    if !(200..300).contains(&status) {
-        return Err(format!("GitHub 返回 HTTP {status}"));
-    }
-    let release: Release =
-        serde_json::from_str(&body).map_err(|e| format!("解析 release JSON 失败: {e}"))?;
+    let release = fetch_release(core, update).await.map_err(|e| e.message)?;
     let asset = release
         .checksum_asset()
         .ok_or_else(|| "该 release 没有 SHA256SUMS".to_string())?;

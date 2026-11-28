@@ -220,6 +220,8 @@
     "otaApply": "Unduh & ganti",
     "otaApplying": "Mengunduh…",
     "otaRestartHint": "Restart layanan setelah penggantian (systemd / docker restart / manual) agar versi baru berlaku.",
+    "otaSaveFirst": "Simpan pengaturan dulu: tombol pembaruan memakai konfigurasi yang sudah disimpan, jadi perubahan yang belum disimpan tidak dipakai.",
+    "otaEnableFirst": "Aktifkan dan simpan pembaruan mandiri dulu sebelum mengunduh dan mengganti.",
     "updateAvailable": "Versi baru {{latest}} tersedia.",
     "updateUpToDate": "{{current}} sudah versi terbaru.",
     "updateReady": "Biner telah diganti — restart layanan untuk menerapkan."

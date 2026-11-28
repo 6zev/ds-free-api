@@ -333,6 +333,14 @@ const DEFAULT_HIF_LEIM_URL: &str = "https://hif-leim.deepseek.com/query";
 /// 第二个风控令牌端点（前端 `dliqPoller`；本网络常为 NXDOMAIN，取不到就跳过）
 const DEFAULT_HIF_DLIQ_URL: &str = "https://hif-dliq.deepseek.com/query";
 
+/// 外域元数据请求（GitHub Releases JSON / SHA256SUMS）的整体超时
+///
+/// 这类请求只该几百毫秒返回；超过这个上限说明网络已经不通，早点报错好过让
+/// 管理面板的更新按钮一直转圈。
+const ASSET_META_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// 外域产物下载的整体超时（几十 MB 的 tar.gz，留足余量但仍设上限）
+const ASSET_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(10);
+
 /// 传输层拟态档位（TLS/HTTP2 指纹 + 该档位自带的默认请求头）
 ///
 /// 关键在于**自洽**：安卓 App UA 配 Chrome/macOS 的 client hints 与
@@ -940,11 +948,16 @@ impl DsClient {
     ///
     /// 只用于非 DeepSeek 域的辅助请求（GitHub Releases、镜像）。不复用
     /// `parse_envelope`：这些域返回的是裸 JSON / 文本，没有上游信封。
+    ///
+    /// 拟态头是**尽力而为**：`identity.headers()` 绑定的是 DeepSeek 账号的
+    /// `device_id`，未配置设备指纹时会返回 `InvalidHeader`。第三方域（GitHub）
+    /// 根本不看这些头，没必要为了一个空的设备 ID 让整个更新流程失败。
     pub async fn get_text(&self, url: &str) -> Result<(u16, String), ClientError> {
         let resp = self
             .http
             .get(url)
-            .headers(self.identity.headers(FetchSite::CrossSite)?)
+            .headers(self.foreign_headers())
+            .timeout(ASSET_META_TIMEOUT)
             .send()
             .await?;
         let status = resp.status().as_u16();
@@ -953,11 +966,15 @@ impl DsClient {
     }
 
     /// 用本客户端取任意 URL 的原始字节（发布产物下载）
+    ///
+    /// 下载产物可能是几十 MB，所以给的是比元数据宽松得多的整体超时；仍必须有上限，
+    /// 否则管理面板的「下载并替换」会无限挂着一条 HTTP 请求。
     pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, ClientError> {
         let resp = self
             .http
             .get(url)
-            .headers(self.identity.headers(FetchSite::CrossSite)?)
+            .headers(self.foreign_headers())
+            .timeout(ASSET_DOWNLOAD_TIMEOUT)
             .send()
             .await?;
         let status = resp.status();
@@ -969,6 +986,16 @@ impl DsClient {
         }
         let bytes = resp.bytes().await?;
         Ok(bytes.to_vec())
+    }
+
+    /// 非 DeepSeek 域（GitHub / 镜像）用的请求头：拟态头可失败即降级为空
+    fn foreign_headers(&self) -> wreq::header::HeaderMap {
+        self.identity
+            .headers(FetchSite::CrossSite)
+            .unwrap_or_else(|e| {
+                log::debug!(target: "ds_core::client", "拟态头不适用于外域请求，改用裸头: {e}");
+                wreq::header::HeaderMap::new()
+            })
     }
 
     #[allow(dead_code)]

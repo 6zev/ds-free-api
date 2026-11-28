@@ -220,6 +220,8 @@
     "otaApply": "Download & replace",
     "otaApplying": "Downloading…",
     "otaRestartHint": "Restart the service after the replacement (systemd / docker restart / manual) for the new version to take effect.",
+    "otaSaveFirst": "Save your settings first: the update buttons use the saved config, so unsaved toggles or repo changes are not applied.",
+    "otaEnableFirst": "Enable and save self-update first, then you can download and replace.",
     "updateAvailable": "New version {{latest}} is available.",
     "updateUpToDate": "{{current}} is already the latest version.",
     "updateReady": "Binary replaced — restart the service to apply."

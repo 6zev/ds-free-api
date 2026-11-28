@@ -3,6 +3,10 @@
 //! 本模块负责将 adapter / compat 层包装为 axum HTTP 服务。
 
 mod admin;
+
+#[cfg(test)]
+pub(crate) use admin::update_error_status;
+
 mod auth;
 mod error;
 mod handlers;

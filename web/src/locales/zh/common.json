@@ -220,6 +220,8 @@
     "otaApply": "下载并替换",
     "otaApplying": "正在下载…",
     "otaRestartHint": "替换完成后请重启服务（systemd / docker restart / 手动），新版本才会生效。",
+    "otaSaveFirst": "请先保存设置：更新按钮读取的是已保存的配置，「下载并替换」不会自动应用面板里未保存的开关与仓库。",
+    "otaEnableFirst": "请先勾选并保存「自更新」开关，才能下载并替换。",
     "updateAvailable": "发现新版本 {{latest}}，可下载应用。",
     "updateUpToDate": "当前版本 {{current}} 已是最新。",
     "updateReady": "已替换二进制，重启服务后生效。"

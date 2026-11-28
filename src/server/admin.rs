@@ -860,11 +860,11 @@ pub(crate) async fn admin_update_check(State(state): State<AppState>) -> Respons
         Err(e) => {
             let status = crate::self_update::UpdateStatus::Failed {
                 latest: None,
-                error: e.clone(),
+                error: e.message.clone(),
                 at: crate::self_update::now_secs(),
             };
-            *state.update_status.status.write().await = status.clone();
-            error_response(StatusCode::BAD_GATEWAY, &format!("{e} ({status:?})"))
+            *state.update_status.status.write().await = status;
+            error_response(update_error_status(e.kind), &e.message)
         }
     }
 }
@@ -890,39 +890,88 @@ pub(crate) async fn admin_update_apply(State(state): State<AppState>) -> Respons
         Err(e) => {
             *state.update_status.status.write().await = crate::self_update::UpdateStatus::Failed {
                 latest: None,
-                error: e.clone(),
+                error: e.message.clone(),
                 at: crate::self_update::now_secs(),
             };
-            error_response(StatusCode::BAD_GATEWAY, &e)
+            log::warn!(target: "self_update", "应用更新失败（{:?}）: {}", e.kind, e.message);
+            error_response(update_error_status(e.kind), &e.message)
         }
     }
 }
 
+/// 把 OTA 失败分类映射成 HTTP 状态码
+///
+/// 关键点：**只有真正的外部依赖故障才是 502**。以前一律 502，导致前端把
+/// 「已是最新」「allow_apply=false」也显示成 `API error: 502`，用户无从下手。
+pub(crate) const fn update_error_status(kind: crate::self_update::UpdateErrorKind) -> StatusCode {
+    match kind {
+        crate::self_update::UpdateErrorKind::Rejected => StatusCode::CONFLICT,
+        crate::self_update::UpdateErrorKind::Upstream => StatusCode::BAD_GATEWAY,
+        crate::self_update::UpdateErrorKind::Apply => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 /// 实际执行：检查 → 下载 → 校验 → 替换，并逐步写入状态供 UI 轮询
-async fn run_apply(state: AppState) -> Result<crate::self_update::UpdateStatus, String> {
+async fn run_apply(
+    state: AppState,
+) -> Result<crate::self_update::UpdateStatus, crate::self_update::UpdateError> {
+    use crate::self_update::{UpdateError, UpdateErrorKind, UpdateStatus};
+
     let update_cfg = {
         let config = state.config.read().await;
         if !config.update.enabled {
-            return Err("[update] enabled = false，管理面板未开启自更新".to_string());
+            return Err(UpdateError {
+                kind: UpdateErrorKind::Rejected,
+                message: "[update] enabled = false：先在设置里打开自更新，再点「下载并替换」"
+                    .to_string(),
+            });
         }
         if !config.update.allow_apply {
-            return Err("[update] allow_apply = false，只允许检查不允许应用".to_string());
+            return Err(UpdateError {
+                kind: UpdateErrorKind::Rejected,
+                message: "[update] allow_apply = false：打开它后保存，才能从面板下载并替换二进制"
+                    .to_string(),
+            });
         }
         config.update.clone()
     };
+
+    // 上一轮已经替换过二进制、只差重启：此时再跑一次会拿「已备份的旧二进制」
+    // 去覆盖刚换上的新二进制（版本号仍是旧的 → 又判定「可更新」），属于
+    // fix-on-fix。这里直接拒绝，并告诉用户该做什么。
+    if let UpdateStatus::Ready { latest, backup, .. } =
+        state.update_status.status.read().await.clone()
+    {
+        return Err(UpdateError {
+            kind: UpdateErrorKind::Rejected,
+            message: format!(
+                "已替换为 {latest}，等待重启生效；备份在 {backup}。重启服务后再检查更新"
+            ),
+        });
+    }
+
     let current = env!("CARGO_PKG_VERSION");
     let view = crate::self_update::check(state.adapter.ds_core(), &update_cfg, current).await?;
     if !view.update_available {
-        return Err(format!("当前版本 {current} 已是最新（{}）", view.latest));
+        return Err(UpdateError {
+            kind: UpdateErrorKind::Rejected,
+            message: format!("当前版本 {current} 已是最新（{}），无需更新", view.latest),
+        });
     }
     let (Some(latest), Some(asset)) = (Some(view.latest.clone()), view.asset.clone()) else {
-        return Err("最新版本缺少本平台产物".to_string());
+        return Err(UpdateError {
+            kind: UpdateErrorKind::Rejected,
+            message: format!(
+                "最新版本 {} 没有本平台（{}）的产物",
+                view.latest, view.deploy_id
+            ),
+        });
     };
-    *state.update_status.status.write().await = crate::self_update::UpdateStatus::Downloading {
-        latest: latest.clone(),
-        asset,
-    };
+    *state.update_status.status.write().await = UpdateStatus::Downloading { latest, asset };
 
-    let bin = crate::self_update::current_exe()?;
+    let bin = crate::self_update::current_exe().map_err(|e| UpdateError {
+        kind: UpdateErrorKind::Apply,
+        message: e,
+    })?;
     crate::self_update::download_and_apply(state.adapter.ds_core(), &update_cfg, &view, &bin).await
 }

@@ -76,6 +76,13 @@ export function SettingsPage() {
   };
 
   const handleUpdateApply = async () => {
+    // 面板里的开关只改了本地草稿；后端读的是已保存的 config.toml。
+    // 没保存就点「下载并替换」必然被拒（enabled/allow_apply=false 或旧 repo），
+    // 所以这里先拦一下，直接告诉用户去保存，而不是让他去猜 4xx 的原因。
+    if (isDirty) {
+      setUpdateMsg({ type: 'err', text: t('settings.otaSaveFirst') });
+      return;
+    }
     setUpdateBusy('apply');
     setUpdateMsg(null);
     try {
@@ -999,9 +1006,17 @@ export function SettingsPage() {
                 onClick={handleUpdateApply}
                 disabled={
                   updateBusy !== null ||
+                  isDirty ||
                   !updateCheck?.update_available ||
                   !config.update.enabled ||
                   !config.update.allow_apply
+                }
+                title={
+                  isDirty
+                    ? t('settings.otaSaveFirst')
+                    : !config.update.enabled
+                      ? t('settings.otaEnableFirst')
+                      : undefined
                 }
               >
                 <DownloadCloud className="h-3.5 w-3.5" />
@@ -1013,6 +1028,9 @@ export function SettingsPage() {
                 </Badge>
               )}
             </div>
+            {config.update.enabled && !isDirty && (
+              <p className="text-[11px] text-muted-foreground">{t('settings.otaRestartHint')}</p>
+            )}
             {updateMsg && (
               <p
                 className={cn(
