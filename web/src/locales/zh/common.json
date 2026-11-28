@@ -58,7 +58,10 @@
       "busy": "忙碌",
       "error": "异常",
       "invalid": "失效",
-      "accounts": "个账号"
+      "accounts": "个账号",
+      "syncRejected": "上次保存有 {{count}} 个账号被拒",
+      "syncTimedOut": "上次账号同步超时——后台会自动重试",
+      "syncReason": "{{id}}：{{reason}}"
     },
     "refresh": "刷新",
     "quotaUsed": "本小时 {{used}} / {{limit}}",
@@ -164,7 +167,12 @@
       "placeholder": "http://127.0.0.1:7890",
       "bypassHosts": "不走代理的主机（逗号分隔）",
       "bypassPlaceholder": "localhost, .lan"
-    }
+    },
+    "saveSuccessAccounts": "已保存 · 新增 {{added}} 个账号",
+    "saveSuccessNoNew": "已保存 · 无新增账号",
+    "saveFailedAccounts": "已保存，但 {{failed}} 个账号被拒绝",
+    "saveTimedOut": "已保存，但账号登录仍在后台进行——请稍后查看账号池",
+    "accountRejected": "{{id}} — {{reason}}"
   },
   "settings": {
     "title": "设置",

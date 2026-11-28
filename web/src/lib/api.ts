@@ -135,6 +135,8 @@ export interface AdminStatusResponse {
   invalid: number;
   /** 后端二进制版本，由 `CARGO_PKG_VERSION` 下发 */
   version: string;
+  /** 最近一次账号同步结果（新增账号被拒时用于提示原因） */
+  last_sync?: AccountSyncReport;
 }
 
 export interface StatsSnapshot {
@@ -448,8 +450,26 @@ export async function apiFetchConfig(): Promise<FullConfig> {
   return normalizeConfig(data);
 }
 
-export async function apiSaveConfig(config: Record<string, unknown>): Promise<{ ok: boolean }> {
-  return apiFetch<{ ok: boolean }>('/admin/api/config', {
+export interface AccountSyncFailure {
+  id: string;
+  reason: string;
+}
+
+export interface AccountSyncReport {
+  added: number;
+  removed: number;
+  failed: number;
+  failures: AccountSyncFailure[];
+  timed_out?: boolean;
+}
+
+export interface SaveConfigResult {
+  ok: boolean;
+  accounts?: AccountSyncReport;
+}
+
+export async function apiSaveConfig(config: Record<string, unknown>): Promise<SaveConfigResult> {
+  return apiFetch<SaveConfigResult>('/admin/api/config', {
     method: 'PUT',
     body: JSON.stringify(config),
   });

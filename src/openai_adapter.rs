@@ -69,6 +69,8 @@ pub struct OpenAIAdapter {
     default_search_enabled: std::sync::atomic::AtomicBool,
     /// 缓存的 tiktoken BPE 编码器（避免每次请求重建）
     bpe: Option<Arc<tiktoken_rs::CoreBPE>>,
+    /// 最近一次账号同步结果（供面板在保存后继续展示被拒账号）
+    last_sync_report: std::sync::Mutex<Option<AccountSyncReport>>,
 }
 
 impl OpenAIAdapter {
@@ -130,6 +132,7 @@ impl OpenAIAdapter {
                 config.ds_core.default_search_enabled,
             ),
             bpe,
+            last_sync_report: std::sync::Mutex::new(None),
         })
     }
 
@@ -468,9 +471,71 @@ impl OpenAIAdapter {
     }
 }
 
+/// 单个账号同步失败的原因
+///
+/// 管理面板新增账号时，池子拒绝一个账号绝不会是「无原因」：登录被拒、
+/// 被禁言、缺设备指纹、配额/网络异常都会落到某一种 `PoolError`。这里把
+/// 错误翻成用户看得懂的中文，避免面板出现「加了却没反应」的黑箱。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccountSyncFailure {
+    /// 面板里填写的账号标识（邮箱或手机号）
+    pub id: String,
+    /// 拒绝原因（中文，可直接展示）
+    pub reason: String,
+}
+
+/// 一次账号同步的结果汇总
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AccountSyncReport {
+    pub added: usize,
+    pub removed: usize,
+    pub failed: usize,
+    pub failures: Vec<AccountSyncFailure>,
+    /// 同步是否因为超时被提前中断（账号由后台恢复任务继续处理）
+    #[serde(default)]
+    pub timed_out: bool,
+}
+
+/// 把账号池错误翻成可读的中文原因
+fn account_sync_failure_reason(e: &ds_core::PoolError) -> String {
+    // PoolError::Client 内部携带的 ClientError 不是公开类型，这里用 Display 文本
+    // 判断具体的失败类别：Display 里已经带 biz_code / HTTP 状态，足够分类。
+    match e {
+        ds_core::PoolError::Validation(msg) => msg.clone(),
+        ds_core::PoolError::Pow(err) => format!("PoW 求解失败：{err}"),
+        ds_core::PoolError::AlreadyExists(id) => format!("账号已存在于池中：{id}"),
+        ds_core::PoolError::NotFound(id) => format!("账号不存在：{id}"),
+        ds_core::PoolError::AccountBusy(id) => format!("账号正忙，无法移除：{id}"),
+        ds_core::PoolError::AllAccountsFailed => "所有账号初始化失败".to_string(),
+        ds_core::PoolError::Client(inner) => {
+            let text = inner.to_string();
+            let code = text
+                .split("code=")
+                .nth(1)
+                .and_then(|rest| rest.split([' ', ',']).next())
+                .and_then(|n| n.parse::<i64>().ok());
+            match code {
+                Some(2) => "账号或密码错误（biz_code=2）".to_string(),
+                Some(5) => format!("账号被禁言/限流，等待 mute_until 过后再试（biz_code=5，{text}）"),
+                Some(10) => "账号已被封禁（biz_code=10）".to_string(),
+                Some(11) => "设备指纹被上游拒绝 RISK_DEVICE_DETECTED（biz_code=11）：请为该账号填写真实浏览器的 device_id".to_string(),
+                Some(c) => format!("上游业务错误 biz_code={c}：{text}"),
+                None => format!("登录失败：{text}"),
+            }
+        }
+    }
+}
+
 impl OpenAIAdapter {
     /// 批量同步账号：对比当前账号池与目标配置，增删差异账号
-    pub(crate) async fn sync_accounts(&self, new_accounts: &[crate::config::Account]) {
+    ///
+    /// 返回 `AccountSyncReport` 而不是把错误吞进日志：管理面板保存后要把
+    /// 「配了但没进池」的账号连同拒绝原因回报给用户。早期实现只 `log::warn!`，
+    /// 账号静默缺席（登录失败、被禁言、缺 device_id），面板上什么都看不到。
+    pub(crate) async fn sync_accounts(
+        &self,
+        new_accounts: &[crate::config::Account],
+    ) -> AccountSyncReport {
         let old_statuses = self.account_statuses();
         let old_ids: Vec<String> = old_statuses
             .iter()
@@ -483,26 +548,33 @@ impl OpenAIAdapter {
             })
             .collect();
 
-        let mut _added = 0usize;
-        let mut _failed = 0usize;
+        let mut report = AccountSyncReport::default();
         for acct in new_accounts {
             let id = if acct.email.is_empty() {
                 &acct.mobile
             } else {
                 &acct.email
             };
-            if !old_ids.contains(id) {
-                match self.add_account(acct).await {
-                    Ok(_) => _added += 1,
-                    Err(e) => {
-                        log::warn!(target: "adapter", "failed to add account during sync {id}: {e}");
-                        _failed += 1;
-                    }
+            if old_ids.contains(id) {
+                continue;
+            }
+            match self.add_account(acct).await {
+                Ok(_) => report.added += 1,
+                Err(e) => {
+                    let reason = account_sync_failure_reason(&e);
+                    log::warn!(
+                        target: "adapter",
+                        "failed to add account during sync {id}: {e}"
+                    );
+                    report.failed += 1;
+                    report.failures.push(AccountSyncFailure {
+                        id: id.clone(),
+                        reason,
+                    });
                 }
             }
         }
 
-        let mut _removed = 0usize;
         let new_ids: Vec<&str> = new_accounts
             .iter()
             .map(|a| {
@@ -516,13 +588,27 @@ impl OpenAIAdapter {
         for old_id in &old_ids {
             if !new_ids.contains(&old_id.as_str()) && !old_id.is_empty() {
                 match self.remove_account(old_id) {
-                    Ok(_) => _removed += 1,
+                    Ok(_) => report.removed += 1,
                     Err(e) => {
-                        log::warn!(target: "adapter", "failed to remove account during sync {old_id}: {e}");
+                        log::warn!(
+                            target: "adapter",
+                            "failed to remove account during sync {old_id}: {e}"
+                        );
                     }
                 }
             }
         }
+
+        if report.failed > 0 {
+            log::warn!(
+                target: "adapter",
+                "账号同步完成：新增 {} 个、移除 {} 个、失败 {} 个",
+                report.added,
+                report.removed,
+                report.failed
+            );
+        }
+        report
     }
 
     /// 从流中提取首个 Meta 事件的 account_id，同时保留 Meta 在流中
@@ -561,9 +647,35 @@ impl OpenAIAdapter {
         self.ds_core.shutdown().await;
     }
 
+    /// 同步账号池（公开版本，供管理面板在保存时同步调用并回报失败原因）
+    ///
+    /// 与 `reload_config` 拆开是因为这两步的耗时与失败语义不同：
+    /// 账号同步要真的登录上游（每个新账号一次请求），结果必须回给用户；
+    /// 客户端/WASM 重建很慢且失败只需重启，改在后台跑。
+    pub async fn sync_accounts_now(
+        &self,
+        accounts: &[crate::config::Account],
+    ) -> AccountSyncReport {
+        let report = self.sync_accounts(accounts).await;
+        if let Ok(mut slot) = self.last_sync_report.lock() {
+            *slot = Some(report.clone());
+        }
+        report
+    }
+
+    /// 读取最近一次账号同步结果（面板保存后可继续查看被拒账号）
+    pub fn last_sync_report(&self) -> Option<AccountSyncReport> {
+        self.last_sync_report
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    /// 热重载配置：重建模型注册表与底层客户端（**不含**账号同步）
+    ///
+    /// 账号同步由 `sync_accounts_now` 在保存请求里同步完成并回报原因，这里
+    /// 只做不需要用户等待的部分；失败返回 `Err`，调用方提示「重启后生效」。
     pub async fn reload_config(&self, new_config: &crate::config::Config) -> Result<(), CoreError> {
-        // Sync accounts
-        self.sync_accounts(&new_config.ds_core.accounts).await;
         // Rebuild model registry
         let registry = new_config.ds_core.model_registry();
         *self.model_registry.write().await = registry;
@@ -718,5 +830,53 @@ impl OpenAIAdapterError {
             Self::ProviderError(_) => 502,
             Self::Internal(_) | Self::ToolCallRepairNeeded(_) => 500,
         }
+    }
+}
+
+#[cfg(test)]
+mod account_sync_tests {
+    use super::*;
+
+    #[test]
+    fn validation_error_reason_is_passthrough() {
+        let e = ds_core::PoolError::Validation("账号异常(muted/limited)，mute_until=123".into());
+        let r = account_sync_failure_reason(&e);
+        assert!(r.contains("muted/limited"));
+    }
+
+    #[test]
+    fn already_exists_reason_mentions_account() {
+        let e = ds_core::PoolError::AlreadyExists("a@b.com".into());
+        let r = account_sync_failure_reason(&e);
+        assert!(r.contains("a@b.com"));
+        assert!(r.contains("已存在"));
+    }
+
+    #[test]
+    fn report_serializes_failures_and_timeout() {
+        let report = AccountSyncReport {
+            added: 1,
+            removed: 0,
+            failed: 2,
+            failures: vec![AccountSyncFailure {
+                id: "x@y.com".into(),
+                reason: "设备指纹被上游拒绝".into(),
+            }],
+            timed_out: false,
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["added"], 1);
+        assert_eq!(json["failed"], 2);
+        assert_eq!(json["failures"][0]["id"], "x@y.com");
+        assert_eq!(json["timed_out"], false);
+    }
+
+    #[test]
+    fn default_report_is_empty_ok() {
+        let report = AccountSyncReport::default();
+        assert_eq!(report.added, 0);
+        assert_eq!(report.failed, 0);
+        assert!(report.failures.is_empty());
+        assert!(!report.timed_out);
     }
 }

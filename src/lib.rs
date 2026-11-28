@@ -11,7 +11,7 @@ pub use ds_core::{
     AccountStatus, ChatRequest, ChatResponse, CoreError, DsCore, FilePayload, StreamEvent,
 };
 pub use openai_adapter::{
-    ChatCompletionsRequest, ChatOutput, ChatResult, OpenAIAdapter, OpenAIAdapterError,
-    StreamResponse,
+    AccountSyncFailure, AccountSyncReport, ChatCompletionsRequest, ChatOutput, ChatResult,
+    OpenAIAdapter, OpenAIAdapterError, StreamResponse,
 };
 pub use responses_adapter::{ResponsesAdapter, ResponsesOutput, ResponsesRequest};

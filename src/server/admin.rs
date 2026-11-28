@@ -9,6 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::handlers::AppState;
+use crate::AccountSyncReport;
 use crate::config::{AutoResumeSection, Config};
 
 // ── 请求/响应类型 ──────────────────────────────────────────────────────────
@@ -38,6 +39,9 @@ pub struct AdminStatusResponse {
     pub invalid: usize,
     /// 后端二进制版本（`CARGO_PKG_VERSION`），WebUI 直接显示它，避免前端硬编码陈旧版本号
     pub version: String,
+    /// 最近一次账号同步结果（新增账号被拒时面板据此提示原因）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_sync: Option<AccountSyncReport>,
 }
 
 #[derive(Serialize)]
@@ -323,6 +327,7 @@ pub(crate) async fn admin_status(State(state): State<AppState>) -> Response {
         error,
         invalid,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        last_sync: state.adapter.last_sync_report(),
     };
     json_response(&resp)
 }
@@ -498,12 +503,33 @@ pub(crate) async fn admin_put_config(
         }
     }
 
-    // Hot-reload: 账号同步 / 客户端与模型注册表重建由后台执行
+    // 账号同步：同步执行并把失败原因回报给面板
     //
-    // 这些步骤会真的发网络请求（新增账号要登录、重建客户端要拉 WASM），
-    // 曾经在保存请求里同步跑完：一旦上游慢或失败，保存就已经落盘成功，
-    // 但 HTTP 层拿不到响应被反代记成 502，用户看到「保存失败」而配置其实已生效。
-    // 现在立刻返回 ok，热重载在后台继续；失败只进运行日志，不回滚已保存的配置。
+    // 账号池「加了账号却报不出东西」的根因就在这里：旧实现把 add_account 的错误
+    // 吞进 log::warn!，后台任务又只记 reload 的整体 Err，面板拿到的永远是 {"ok":true}。
+    // 新增账号必须真的登录上游，所以要等它完成才能告诉用户「成功/被拒/为什么」。
+    // 为防止慢上游把保存请求拖成 502，这里加超时——超时的账号按「未确认」回报，
+    // 后台恢复任务会在 60s 内重试登录。
+    let sync_report = tokio::time::timeout(
+        ACCOUNT_SYNC_TIMEOUT,
+        state
+            .adapter
+            .sync_accounts_now(&new_config.ds_core.accounts),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        log::warn!(
+            target: "http::server",
+            "账号同步超时（{}s），未完成的新增账号将由后台恢复任务重试",
+            ACCOUNT_SYNC_TIMEOUT.as_secs()
+        );
+        AccountSyncReport {
+            timed_out: true,
+            ..AccountSyncReport::default()
+        }
+    });
+
+    // 客户端与模型注册表重建放后台：要重新拉 WASM，慢但失败只需重启即可
     let adapter = state.adapter.clone();
     let cfg = new_config.clone();
     tokio::spawn(async move {
@@ -511,8 +537,20 @@ pub(crate) async fn admin_put_config(
             log::warn!(target: "http::server", "配置已保存但热重载失败（重启后生效）: {e}");
         }
     });
-    json_response(&serde_json::json!({"ok": true}))
+
+    // 有账号被拒 / 同步超时 → 200 仍返回 ok，但附带 accounts 明细供面板提示
+    let body = serde_json::json!({
+        "ok": true,
+        "accounts": sync_report,
+    });
+    json_response(&body)
 }
+
+/// 账号同步在保存请求里的最长等待时间
+///
+/// 新增一个账号通常是一次登录往返（< 2s）；给到 20s 足够覆盖慢网络，
+/// 又不会让网关把保存请求记成 502。
+const ACCOUNT_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Deserialize)]
 pub struct LogsQuery {

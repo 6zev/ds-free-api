@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.2] - 2026-11-28
+
+### 修复：管理面板添加账号后「账号池」无任何反馈
+
+- **根因**：新增账号的登录结果在 `sync_accounts` 里被 `log::warn!` 吞掉，
+  `AccountStatus` 也没有错误字段，所以无论账号被拒还是超时，保存响应都只有
+  `{"ok": true}`，面板无从提示「为什么这个账号没进去」。
+- **改动**：
+  - `sync_accounts` 由返回 `()` 改为返回 `AccountSyncReport`
+    `{ added, removed, failed, failures[], timed_out }`；`failures` 逐条携带
+    `{ id, reason }`。
+  - 新增 `account_sync_failure_reason`：把 `PoolError` 映射成中文原因，其中
+    `PoolError::Client(inner)` 解析 `inner.to_string()` 的 `code=`，`biz_code 11`
+    归一为 `RISK_DEVICE_DETECTED` 并提示为账号填写真实 `device_id`。
+  - `admin_put_config` 在 `tokio::time::timeout(20s)` 内同步执行账号同步，把
+    `accounts` 明细随 `{"ok": true}` 一起返回；超时以 `timed_out: true` 回报，
+    未完成的账号由后台恢复任务重试。客户端 / WASM 重建（`reload_config`）仍
+    放后台 `tokio::spawn`，保证保存不再变成 502。
+  - 最近一次同步结果缓存在 `OpenAIAdapter.last_sync_report`，经
+    `GET /admin/api/status` 的 `last_sync` 字段暴露，面板每次轮询都能看到
+    （覆盖保存响应已结束 / 超时的场景）。
+- **前端**：
+  - `ConfigPage` 保存后按结果分支提示：成功新增、被拒（逐账号列出原因）、
+    同步超时（amber 警告）。
+  - `DashboardPage` 账号池卡片新增 `last_sync` 警告条，展示上次保存被拒 /
+    超时的账号与原因。三语 locale 同步补齐。
+
 ## [0.7.1] - 2026-11-28
 
 ### 修复：管理面板「保存」返回 502（配置其实已生效）

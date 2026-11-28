@@ -295,6 +295,36 @@ export function DashboardPage() {
             </div>
           </div>
 
+          {/* Last account sync outcome (rejected / timed out) */}
+          {status?.last_sync &&
+            (status.last_sync.timed_out ||
+              (status.last_sync.failures?.length ?? 0) > 0) && (
+              <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300 space-y-1">
+                {status.last_sync.timed_out && (
+                  <div className="font-medium">{t('dashboard.accountPool.syncTimedOut')}</div>
+                )}
+                {(status.last_sync.failures?.length ?? 0) > 0 && (
+                  <>
+                    <div className="font-medium">
+                      {t('dashboard.accountPool.syncRejected', {
+                        count: status.last_sync.failed,
+                      })}
+                    </div>
+                    <ul className="space-y-0.5 pl-3">
+                      {status.last_sync.failures.map((f) => (
+                        <li key={f.id} className="whitespace-pre-line break-words list-disc">
+                          {t('dashboard.accountPool.syncReason', {
+                            id: f.id,
+                            reason: f.reason,
+                          })}
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+              </div>
+            )}
+
           {/* Account List Chips */}
           {status?.accounts && status.accounts.length > 0 && (
             <div className="flex flex-wrap gap-1.5 pt-1">

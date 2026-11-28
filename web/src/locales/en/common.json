@@ -58,7 +58,10 @@
       "busy": "Busy",
       "error": "Error",
       "invalid": "Invalid",
-      "accounts": "Accounts"
+      "accounts": "Accounts",
+      "syncRejected": "{{count}} account(s) rejected on last save",
+      "syncTimedOut": "Last account sync timed out — retrying in background",
+      "syncReason": "{{id}}: {{reason}}"
     },
     "refresh": "Refresh",
     "quotaUsed": "{{used}} / {{limit}} this hour",
@@ -164,7 +167,12 @@
       "placeholder": "http://127.0.0.1:7890",
       "bypassHosts": "Hosts to bypass the proxy (comma separated)",
       "bypassPlaceholder": "localhost, .lan"
-    }
+    },
+    "saveSuccessAccounts": "Saved · {{added}} account(s) added",
+    "saveSuccessNoNew": "Saved · no new accounts",
+    "saveFailedAccounts": "Saved, but {{failed}} account(s) were rejected",
+    "saveTimedOut": "Saved, but account login is still running in the background — check the Account Pool shortly",
+    "accountRejected": "{{id}} — {{reason}}"
   },
   "settings": {
     "title": "Settings",

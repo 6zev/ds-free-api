@@ -58,7 +58,10 @@
       "busy": "Sibuk",
       "error": "Error",
       "invalid": "Tidak Valid",
-      "accounts": "Akun"
+      "accounts": "Akun",
+      "syncRejected": "{{count}} akun ditolak saat penyimpanan terakhir",
+      "syncTimedOut": "Sinkronisasi akun terakhir timeout — dicoba ulang di latar belakang",
+      "syncReason": "{{id}}: {{reason}}"
     },
     "refresh": "Segarkan",
     "quotaUsed": "{{used}} / {{limit}} jam ini",
@@ -164,7 +167,12 @@
       "placeholder": "http://127.0.0.1:7890",
       "bypassHosts": "Host yang melewati proxy (pisahkan dengan koma)",
       "bypassPlaceholder": "localhost, .lan"
-    }
+    },
+    "saveSuccessAccounts": "Tersimpan · {{added}} akun ditambahkan",
+    "saveSuccessNoNew": "Tersimpan · tidak ada akun baru",
+    "saveFailedAccounts": "Tersimpan, tetapi {{failed}} akun ditolak",
+    "saveTimedOut": "Tersimpan, tetapi login akun masih berjalan di latar belakang — periksa Account Pool sebentar lagi",
+    "accountRejected": "{{id}} — {{reason}}"
   },
   "settings": {
     "title": "Pengaturan",

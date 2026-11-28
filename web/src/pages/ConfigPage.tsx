@@ -36,7 +36,7 @@ export function ConfigPage() {
   const [config, setConfig] = useState<FullConfig | null>(null);
   const [initialConfig, setInitialConfig] = useState<string>('');
   const [saving, setSaving] = useState(false);
-  const [message, setMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [message, setMessage] = useState<{ type: 'ok' | 'err' | 'warn'; text: string } | null>(null);
   const [revealedKeys, setRevealedKeys] = useState<Record<number, boolean>>({});
   const [revealedPasswords, setRevealedPasswords] = useState<Record<number, boolean>>({});
   const [copiedKeyIdx, setCopiedKeyIdx] = useState<number | null>(null);
@@ -131,7 +131,22 @@ export function ConfigPage() {
       };
       const res = await apiSaveConfig(body);
       if (res.ok) {
-        setMessage({ type: 'ok', text: t('config.saveSuccess') });
+        const report = res.accounts;
+        if (report && report.timed_out) {
+          setMessage({ type: 'warn', text: t('config.saveTimedOut') });
+        } else if (report && report.failed > 0) {
+          const detail = report.failures
+            .map((f) => t('config.accountRejected', { id: f.id, reason: f.reason }))
+            .join('\n');
+          setMessage({
+            type: 'warn',
+            text: `${t('config.saveFailedAccounts', { failed: report.failed })}\n${detail}`,
+          });
+        } else if (report && report.added > 0) {
+          setMessage({ type: 'ok', text: t('config.saveSuccessAccounts', { added: report.added }) });
+        } else {
+          setMessage({ type: 'ok', text: t('config.saveSuccess') });
+        }
         setRevealedKeys({});
         const fresh = await apiFetchConfig();
         setConfig(fresh);
@@ -202,18 +217,20 @@ export function ConfigPage() {
       {/* Alert Message */}
       {message && (
         <div
-          className={`flex items-center gap-2.5 p-3 rounded-xl text-xs font-medium border ${
+          className={`flex items-start gap-2.5 p-3 rounded-xl text-xs font-medium border ${
             message.type === 'err'
               ? 'bg-destructive/10 text-destructive border-destructive/20'
-              : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20'
+              : message.type === 'warn'
+                ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20'
+                : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20'
           }`}
         >
-          {message.type === 'err' ? (
-            <AlertCircle className="h-4 w-4 shrink-0" />
+          {message.type === 'err' || message.type === 'warn' ? (
+            <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
           ) : (
-            <CheckCircle2 className="h-4 w-4 shrink-0" />
+            <CheckCircle2 className="h-4 w-4 shrink-0 mt-0.5" />
           )}
-          <span>{message.text}</span>
+          <span className="whitespace-pre-line break-words">{message.text}</span>
         </div>
       )}
 
