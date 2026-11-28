@@ -73,7 +73,7 @@ export function LoginPage() {
             <span className="font-bold text-sm sm:text-base leading-none tracking-tight truncate">
               DS Free API
             </span>
-            <span className="text-[10px] text-muted-foreground font-mono mt-0.5">v0.2.6</span>
+            <span className="text-[10px] text-muted-foreground font-mono mt-0.5">{__APP_VERSION__}</span>
           </div>
         </div>
 

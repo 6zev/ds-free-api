@@ -36,6 +36,8 @@ pub struct AdminStatusResponse {
     pub busy: usize,
     pub error: usize,
     pub invalid: usize,
+    /// 后端二进制版本（`CARGO_PKG_VERSION`），WebUI 直接显示它，避免前端硬编码陈旧版本号
+    pub version: String,
 }
 
 #[derive(Serialize)]
@@ -320,6 +322,7 @@ pub(crate) async fn admin_status(State(state): State<AppState>) -> Response {
         busy,
         error,
         invalid,
+        version: env!("CARGO_PKG_VERSION").to_string(),
     };
     json_response(&resp)
 }
@@ -495,11 +498,19 @@ pub(crate) async fn admin_put_config(
         }
     }
 
-    // Hot-reload: sync accounts from the new config
-    state
-        .adapter
-        .sync_accounts(&new_config.ds_core.accounts)
-        .await;
+    // Hot-reload: 账号同步 / 客户端与模型注册表重建由后台执行
+    //
+    // 这些步骤会真的发网络请求（新增账号要登录、重建客户端要拉 WASM），
+    // 曾经在保存请求里同步跑完：一旦上游慢或失败，保存就已经落盘成功，
+    // 但 HTTP 层拿不到响应被反代记成 502，用户看到「保存失败」而配置其实已生效。
+    // 现在立刻返回 ok，热重载在后台继续；失败只进运行日志，不回滚已保存的配置。
+    let adapter = state.adapter.clone();
+    let cfg = new_config.clone();
+    tokio::spawn(async move {
+        if let Err(e) = adapter.reload_config(&cfg).await {
+            log::warn!(target: "http::server", "配置已保存但热重载失败（重启后生效）: {e}");
+        }
+    });
     json_response(&serde_json::json!({"ok": true}))
 }
 
@@ -617,6 +628,15 @@ device_id = "dev-1"
 [proxy]
 url = "http://127.0.0.1:7890"
 
+[update]
+enabled = true
+check_on_startup = true
+allow_apply = false
+repo = "owner/repo"
+use_latest = false
+target_tag = "v9.9.9"
+api_base = "https://api.github.test"
+
 [[api_keys]]
 key = "sk-test"
 description = "test"
@@ -674,7 +694,7 @@ description = "test"
         let json = serde_json::to_value(&view).expect("serialize admin config view");
 
         // FullConfig 的标量与对象字段
-        for field in ["server", "ds_core", "proxy", "admin", "api_keys"] {
+        for field in ["server", "ds_core", "proxy", "update", "admin", "api_keys"] {
             assert!(json.get(field).is_some(), "缺少顶层字段 {field}");
         }
 
@@ -691,6 +711,11 @@ description = "test"
         let proxy = json.get("proxy").expect("proxy key");
         for field in ts_interface_fields(API_TS, "ProxyConfig") {
             assert!(proxy.get(&field).is_some(), "proxy view 缺少字段 {field}");
+        }
+
+        let update = json.get("update").expect("update key");
+        for field in ts_interface_fields(API_TS, "UpdateConfig") {
+            assert!(update.get(&field).is_some(), "update view 缺少字段 {field}");
         }
 
         let key = json["api_keys"][0].clone();

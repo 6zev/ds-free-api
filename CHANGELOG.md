@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.1] - 2026-11-28
+
+### 修复：管理面板「保存」返回 502（配置其实已生效）
+
+- **根因**：`admin_put_config` 在**返回响应之前**同步执行
+  `sync_accounts` / 客户端重建 —— 新增账号会真的登录上游、重建客户端会真的拉取
+  WASM。上游一慢，配置已 `save()` 落盘，但 HTTP 层迟迟拿不到响应，被前置反向代理
+  记成 `502`；用户看到「保存失败」，刷新却发现值已保存。
+- **改动**：保存路径只做解析 / 校验 / 落盘，随即返回 `{"ok": true}`；热重载
+  （`reload_config`）挪到后台 `tokio::spawn` 执行。重载失败只记 `warn` 日志
+  （「配置已保存但热重载失败，重启后生效」），不再回滚已落盘的配置，也不会再把
+  慢速上游的等待时间转嫁成 HTTP 502。
+
+### 修复：WebUI 显示过期版本号（一直停在 `v0.2.6`）
+
+- **根因**：版本号在前端 `Layout.tsx`（两处）与 `LoginPage.tsx` 里**硬编码**为
+  `v0.2.6`，从未跟随后端发布更新。
+- **改动**：改由构建期注入 —— `web/vite.config.ts` 新增
+  `define: { __APP_VERSION__ }`，读取 `web/package.json` 的 `version`；
+  `web/src/vite-env.d.ts` 声明该常量；三处硬编码替换为 `__APP_VERSION__`。
+  版本号与 `package.json`（发布时与 `Cargo.toml` 同步 bump）保持单一事实来源。
+
+### 改进：`/v1/models` 只列规范模型 ID（不再同时出现 `default` 与 `deepseek-default`）
+
+- **根因**：`model_ids` 把裸 `model_type` 名（`default`）也列进 `/v1/models`，
+  与规范 ID `deepseek-default` 并列，用户会误以为存在两个模型。
+- **改动**：`/v1/models` 列表只输出**规范 ID**（`deepseek-{ty}`）与用户别名，不再
+  列裸名。裸名仍保留在解析层（`Config::model_registry`），`default` 等写法继续可用
+  （Claude Code / Codex 兼容，issue #99）；`get_model("default")` 仍可命中，
+  返回值的 `id` 是规范拼写 `deepseek-default`，与列表一致。
+
 ## [0.7.0] - 2026-11-28
 
 ### 修复：真实账号下正文仍被截断（只剩首片 1–5 个字，`finish_reason` 是 `stop`）

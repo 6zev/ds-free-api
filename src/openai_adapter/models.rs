@@ -27,13 +27,17 @@ const MODEL_OWNED_BY: &str = "deepseek-web (proxied by https://github.com/NIyuee
 /// - `model_aliases[i]`（用户自定义别名，可选，管理员显式配置才出现）
 ///
 /// 默认配置只有一个 `model_type`（`default`），于是 `/v1/models` 恰好两条：
-/// `deepseek-default` + `default` —— 同一个模型的两个可接受拼写，不是两个模型。
+/// 生成 `list()` 对外展示的有序 ID 列表。
 ///
-/// `deepseek-{ty}` 与 `{ty}` 在忽略大小写后可能相同（例如 `ty = "DeepSeek-X"`），
-/// 因此这里做去重，保证列表内 ID 唯一。
+/// 只包含**规范 ID**（`deepseek-{ty}`）与**用户别名**，不再列出裸 `{ty}`：
+/// 列表里 `default` 与 `deepseek-default` 同时出现会让用户以为有两个模型。
+/// 裸名仍可在请求里使用（Claude Code / Codex 依赖它，issue #99），但那是
+/// 解析层（`Config::model_registry`）的职责，不应污染 `/v1/models` 的展示。
+///
+/// `deepseek-{ty}` 与别名在忽略大小写后可能相同，这里做去重，保证列表内 ID 唯一。
 #[must_use]
 pub fn model_ids(model_types: &[String], aliases: &[String]) -> Vec<(String, usize)> {
-    let mut ids: Vec<(String, usize)> = Vec::with_capacity(model_types.len() * 2 + aliases.len());
+    let mut ids: Vec<(String, usize)> = Vec::with_capacity(model_types.len() + aliases.len());
     let mut seen: Vec<String> = Vec::with_capacity(ids.capacity());
 
     let push = |id: String, idx: usize, ids: &mut Vec<(String, usize)>, seen: &mut Vec<String>| {
@@ -57,11 +61,6 @@ pub fn model_ids(model_types: &[String], aliases: &[String]) -> Vec<(String, usi
         {
             push(alias.clone(), idx, &mut ids, &mut seen);
         }
-    }
-
-    // 3) 裸 model_type 名
-    for (idx, ty) in model_types.iter().enumerate() {
-        push(ty.clone(), idx, &mut ids, &mut seen);
     }
 
     ids
@@ -92,6 +91,10 @@ pub fn list(
 }
 
 /// 查询单个模型（ID 匹配忽略大小写，返回值使用列表中的规范拼写）
+///
+/// 除列表里的规范 ID / 别名外，也接受**裸 model_type 名**（`default`）：
+/// 它是 issue #99 依赖的兼容写法，但返回值的 `id` 仍是规范拼写
+/// （`deepseek-default`），与 `/v1/models` 列表保持一致。
 pub fn get(
     model_types: &[String],
     max_input_tokens: &[u32],
@@ -101,13 +104,25 @@ pub fn get(
 ) -> Option<OpenAIModel> {
     let target = id.trim().to_lowercase();
 
-    // 复用与 list() 完全相同的 ID 集合，杜绝两者漂移
-    let (canonical, idx) = model_ids(model_types, aliases)
+    // 先按列表（规范 ID + 别名）精确匹配，保证与 list() 不漂移
+    if let Some((canonical, idx)) = model_ids(model_types, aliases)
         .into_iter()
-        .find(|(candidate, _)| candidate.to_lowercase() == target)?;
+        .find(|(candidate, _)| candidate.to_lowercase() == target)
+    {
+        return Some(make_model(
+            &canonical,
+            max_input_tokens.get(idx).copied(),
+            max_output_tokens.get(idx).copied(),
+        ));
+    }
 
+    // 回退：裸 model_type 名（`default`）→ 规范拼写 `deepseek-{ty}`
+    let idx = model_types
+        .iter()
+        .position(|ty| ty.to_lowercase() == target)?;
+    let ty = &model_types[idx];
     Some(make_model(
-        &canonical,
+        &format!("deepseek-{ty}"),
         max_input_tokens.get(idx).copied(),
         max_output_tokens.get(idx).copied(),
     ))
@@ -141,14 +156,20 @@ mod tests {
     }
 
     #[test]
-    fn list_includes_prefixed_and_bare_names() {
+    fn list_hides_bare_type_names() {
         let (mi, mo) = limits();
         let list = list(&types(), &mi, &mo, &[]);
         let ids: Vec<&str> = list.data.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"deepseek-default"));
-        assert!(ids.contains(&"default"), "裸 model_type 名必须在列表中");
         assert!(ids.contains(&"deepseek-expert"));
-        assert!(ids.contains(&"expert"));
+        assert!(
+            !ids.contains(&"default"),
+            "裸 model_type 名不应出现在 /v1/models 列表里：{ids:?}"
+        );
+        assert!(
+            !ids.contains(&"expert"),
+            "裸 model_type 名不应列出：{ids:?}"
+        );
     }
 
     #[test]
@@ -157,6 +178,11 @@ mod tests {
         for id in ["deepseek-default", "DEFAULT", "default", "deepseek-expert"] {
             assert!(get(&types(), &mi, &mo, &[], id).is_some(), "{id} 应可查询");
         }
+        // 裸名查询返回规范拼写
+        assert_eq!(
+            get(&types(), &mi, &mo, &[], "default").unwrap().id,
+            "deepseek-default"
+        );
         assert!(get(&types(), &mi, &mo, &[], "nope").is_none());
     }
 

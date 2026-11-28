@@ -80,7 +80,7 @@ export function Layout() {
               {!isSidebarCollapsed && (
                 <div className="hidden lg:flex flex-col min-w-0">
                   <span className="font-bold text-base leading-none tracking-tight truncate">DS Free API</span>
-                  <span className="text-[10px] text-muted-foreground mt-0.5 font-mono">v0.2.6</span>
+                  <span className="text-[10px] text-muted-foreground mt-0.5 font-mono">{__APP_VERSION__}</span>
                 </div>
               )}
             </div>
@@ -149,7 +149,7 @@ export function Layout() {
         <div className="flex items-center gap-2.5 min-w-0">
           <img src="/admin/favicon.svg" alt="Logo" className="h-6 w-6 shrink-0" />
           <span className="font-bold text-base tracking-tight truncate">DS Free API</span>
-          <span className="text-[10px] bg-muted px-1.5 py-0.5 rounded font-mono text-muted-foreground shrink-0">v0.2.6</span>
+          <span className="text-[10px] bg-muted px-1.5 py-0.5 rounded font-mono text-muted-foreground shrink-0">{__APP_VERSION__}</span>
         </div>
         {/* On Mobile, UserDropdown includes Logs & Settings */}
         <UserDropdown placement="top-down" compact={true} showLogs={true} />

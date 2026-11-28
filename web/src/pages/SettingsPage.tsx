@@ -181,6 +181,7 @@ export function SettingsPage() {
         deepseek: config.ds_core,
         accounts: config.ds_core.accounts,
         proxy: config.proxy,
+        update: config.update,
         admin: {
           password_hash: '',
           jwt_secret: '',

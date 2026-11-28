@@ -133,6 +133,8 @@ export interface AdminStatusResponse {
   busy: number;
   error: number;
   invalid: number;
+  /** 后端二进制版本，由 `CARGO_PKG_VERSION` 下发 */
+  version: string;
 }
 
 export interface StatsSnapshot {
